@@ -1,0 +1,866 @@
+/*
+ * Author : Suvajit Majumder
+ * Date : 4th December,2024
+ * Description : This class contains the filter criterias for various processes and then calls the service methods for further processing
+ * Test Class : MP_LeadActionHelperTest
+ */
+@SuppressWarnings('PMD.AvoidDeeplyNestedIfStmts,PMD.CognitiveComplexity')
+public with sharing class MP_LeadActionHelper implements Callable {
+  private static Promise p = null;
+  @testvisible
+  private static List<sObject> lstPermisssionToContact;
+  public Object call(String action, Map<String, Object> args) {
+    switch on action {
+      when 'populateLatestOwnershipChangeDate' {
+        this.populateLatestOwnershipChangeDate(
+          (List<Lead>) args.get('newLeads'),
+          (List<Lead>) args.get('oldLeads')
+        );
+      }
+      when 'handlePostLeadConversionActions' {
+        this.handlePostLeadConversionActions(
+          (List<Lead>) args.get('convertedLeads')
+        );
+      }
+      when 'validateLeadAddress' {
+        this.validateLeadAddress(
+          (List<Lead>) args.get('newLeads'),
+          (List<Lead>) args.get('oldLeads')
+        );
+      }
+      when 'publishResidentialStateChangePE' {
+        this.publishResidentialStateChangePE(
+          (List<Lead>) args.get('newLeads'),
+          (List<Lead>) args.get('oldLeads')
+        );
+      }
+      when 'relateVoiceCallToLead' {
+        this.relateVoiceCallToLead((List<Lead>) args.get('newLeads'));
+      }
+      when 'copyPermissionToContactToAccount' {
+        this.copyPermissionToContactToAccount(
+          (List<Lead>) args.get('convertedLeads')
+        );
+      }
+      when 'executeLeadRouting' {
+        this.executeLeadRouting(
+          (List<Lead>) args.get('newLeads'),
+          (List<Lead>) args.get('oldLeads')
+        );
+      }
+      when 'callECRApiOnCreate' {
+        this.leadEcrAPIOnCreate((List<Lead>) args.get('newList'));
+      }
+      when 'callECRApiOnUpdate' {
+        this.leadEcrAPIonUpdate(
+          (List<Lead>) args.get('newList'),
+          (List<Lead>) args.get('oldList')
+        );
+      }
+      when 'manipulateDNCValues' {
+        this.manipulateDNCValues(
+          (List<Lead>) args.get('newList'),
+          (List<Lead>) args.get('oldList')
+        );
+      }
+      when 'populateSalesAttributesOnLead' {
+        this.populateSalesAttributesOnLead(
+          (List<Lead>) args.get('newList'),
+          (List<Lead>) args.get('oldList')
+        );
+      }
+      when 'processOwnerChangeTrail' {
+        this.processOwnerChangeTrail(
+          (List<Lead>) args.get('newList'),
+          (List<Lead>) args.get('oldList')
+        );
+      }
+      when 'processLeadConversionTrail' {
+        this.processLeadConversionTrail(
+          (List<Lead>) args.get('newList'),
+          (List<Lead>) args.get('oldList')
+        );
+      }
+      when 'calculateRoutingAttributes' {
+        this.calculateRoutingAttributes(
+          (List<Lead>) args.get('newList'),
+          (List<Lead>) args.get('oldList')
+        );
+      }
+      when else {
+        throw new ExtensionMalformedCallException('Method not implemented');
+      }
+    }
+    if (p != null) {
+      System.enqueueJob(p);
+      p = null;
+    }
+    return true;
+  }
+
+  @TestVisible
+  private static MP_LeadSelector_AU leadSelector;
+
+  @TestVisible
+  private static fflib_SObjectUnitOfWork uow;
+
+  @TestVisible
+  private static InsertUnitOfWorkHelper insertWork;
+
+  @InvocableMethod(label='Create Relations')
+  public static void createRelations(List<RelationshipInputDTO> requests) {
+    new MP_LeadActionHelper().processRelations(requests);
+  }
+
+  private List<RelationshipOutputDTO> processRelations(
+    List<RelationshipInputDTO> requests
+  ) {
+    List<RelationshipOutputDTO> responses = new List<RelationshipOutputDTO>();
+    try {
+      Set<Id> accountIds = new Set<Id>();
+
+      for (RelationshipInputDTO request : requests) {
+        accountIds.addAll(
+          new Set<Id>{ request.accountId, request.relatedAccountId }
+        );
+      }
+      Map<Id, Contact> contactMap = System.Test.isRunningTest()
+        ? leadSelector.getPersonContactMapFromAccounts(accountIds)
+        : new MP_LeadSelector_AU().getPersonContactMapFromAccounts(accountIds);
+
+      uow = new fflib_SObjectUnitOfWork(
+        new List<Schema.SObjectType>{
+          Account.SObjectType,
+          ContactContactRelation.SObjectType
+        }
+      );
+      insertWork = new InsertUnitOfWorkHelper();
+      uow.registerWork(insertWork);
+      List<Account> accList = new List<Account>();
+      for (RelationshipInputDTO request : requests) {
+        if (
+          contactMap.containsKey(request.accountId) &&
+          contactMap.containsKey(request.relatedAccountId)
+        ) {
+          generateRelationShips(
+            contactMap.get(request.accountId).Id,
+            contactMap.get(request.relatedAccountId).Id,
+            request.roleName,
+            request.startDate,
+            request.endDate
+          );
+          if (
+            request.roleName == MP_ApexContantsClass.PARTY_ROLE_DECISION_MAKER
+          ) {
+            Account acc = new Account(id = request.accountId);
+            acc.Has_Decision_Maker__c = true;
+            accList.add(acc);
+          }
+        }
+      }
+
+      if (!accList.isEmpty()) {
+        uow.registerDirty(accList);
+      }
+      uow.commitWork();
+      if (insertWork.results != null) {
+        for (Database.SaveResult result : insertWork.results) {
+          RelationshipOutputDTO dto = new RelationshipOutputDTO();
+          dto.ccrId = result.getId();
+          dto.success = result.isSuccess();
+          dto.message = JSON.serialize(result.getErrors());
+          responses.add(dto);
+          if (!result.isSuccess()) {
+            throw new CustomApexException(
+              'Failed to create relationship for record ' +
+              JSON.serialize(result.getErrors())
+            );
+          }
+        }
+      }
+    } catch (Exception e) {
+      LogService.error(e, 'processRelations');
+      throw e;
+    }
+    return responses;
+  }
+  @TestVisible
+  private void handlePostLeadConversionActions(List<Lead> convertedLeads) {
+    try {
+      Map<Id, Contact> decisionMakerMap = System.Test.isRunningTest()
+        ? leadSelector.getDecisionMakerMapFromLeads(convertedLeads)
+        : MP_Lead_Singleton_AU.getInstance().contactMap;
+      uow = new fflib_SObjectUnitOfWork(
+        new List<Schema.SObjectType>{ ContactContactRelation.SObjectType }
+      );
+      insertWork = new InsertUnitOfWorkHelper();
+      uow.registerWork(insertWork);
+      for (Lead lead : convertedLeads) {
+        if (lead.Has_Decision_Maker__c) {
+          generateRelationShips(
+            lead.ConvertedContactId,
+            decisionMakerMap.containsKey(lead.Decision_Maker__c)
+              ? decisionMakerMap.get(lead.Decision_Maker__c).Id
+              : null,
+            MP_ApexContantsClass.PARTY_ROLE_DECISION_MAKER,
+            null,
+            null
+          );
+        }
+      }
+      uow.commitWork();
+    } catch (Exception e) {
+      LogService.error(e, 'handlePostLeadConversionActions');
+    }
+  }
+
+  @TestVisible
+  private void populateLatestOwnershipChangeDate(
+    List<Lead> newList,
+    List<Lead> oldList
+  ) {
+    if (newList != null) {
+      if (oldList != null) {
+        for (Integer i = 0; i < newList.size(); i++) {
+          if (newList[i].OwnerId != oldList[i].OwnerId) {
+            newList[i].Latest_Owner_Change_Timestamp__c = System.now();
+          }
+        }
+      } else {
+        for (Integer i = 0; i < newList.size(); i++) {
+          newList[i].Latest_Owner_Change_Timestamp__c = System.now();
+        }
+      }
+    }
+  }
+
+  @TestVisible
+  private static MP_PartyRoleRelationshipSelector partyRoleSelector;
+
+  @TestVisible
+  private static Map<String, PartyRoleRelation> relationsMap;
+
+  @TestVisible
+  private void generateRelationShips(
+    Id contactId,
+    Id relatedContactId,
+    String roleName,
+    Date startDate,
+    Date endDate
+  ) {
+    if (!System.Test.isRunningTest()) {
+      partyRoleSelector = new MP_PartyRoleRelationshipSelector();
+      relationsMap = MP_PartyRoleRelationshipSingleton.getInstance()
+        .relationsMap;
+    }
+    if (System.Test.isRunningTest()) {
+      relationsMap = partyRoleSelector.getAllRelationsMapByRoleName();
+    }
+    ContactContactRelation ccr = new ContactContactRelation();
+    PartyRoleRelation prr = relationsMap.containsKey(roleName)
+      ? relationsMap.get(roleName)
+      : null;
+
+    if (prr != null) {
+      ccr.IsActive = true;
+      ccr.ContactId = contactId;
+      ccr.RelatedContactId = relatedContactId;
+      ccr.PartyRoleRelationId = prr.Id;
+      ccr.StartDate = startDate != null ? startDate : Date.today();
+      ccr.EndDate = endDate != null ? endDate : null;
+      insertWork.registersObjectInsert(ccr);
+
+      if (prr.ShouldCreaInversRoleAuto) {
+        ContactContactRelation inverseCCR = new ContactContactRelation();
+        inverseCCR.IsActive = true;
+        inverseCCR.ContactId = relatedContactId;
+        inverseCCR.RelatedContactId = contactId;
+        inverseCCR.PartyRoleRelationId = relationsMap.containsKey(
+            prr.RelatedRoleName
+          )
+          ? relationsMap.get(prr.RelatedRoleName).Id
+          : null;
+        inverseCCR.StartDate = startDate != null ? startDate : Date.today();
+        inverseCCR.EndDate = endDate != null ? endDate : null;
+        insertWork.registersObjectInsert(inverseCCR);
+      }
+    }
+  }
+
+  /*
+   * Description : This method is used to check if the Residential Address is changed
+   * @Param :  lead : Contains new lead record
+   * @Param : oldLead : Contains old lead record
+   */
+  @TestVisible
+  private Boolean checkResidentialAddress(Lead lead, Lead oldLead) {
+    Boolean isResidentialAddressChanged = false;
+    if (oldLead != null) {
+      if (
+        lead.Residential_Address__StateCode__s !=
+        oldLead.Residential_Address__StateCode__s ||
+        lead.Residential_Address__PostalCode__s !=
+        oldLead.Residential_Address__PostalCode__s ||
+        lead.Residential_Address__City__s !=
+        oldLead.Residential_Address__City__s ||
+        lead.Residential_Address__Street__s !=
+        oldLead.Residential_Address__Street__s
+      ) {
+        isResidentialAddressChanged = true;
+      }
+    } else {
+      if (
+        lead.Residential_Address__StateCode__s != null &&
+        lead.Residential_Address__PostalCode__s != null &&
+        lead.Residential_Address__City__s != null &&
+        lead.Residential_Address__Street__s != null &&
+        !lead.Residential_Validated__c
+      ) {
+        isResidentialAddressChanged = true;
+      }
+    }
+    return isResidentialAddressChanged;
+  }
+
+  /*
+   * Description : This method is used to check if the Mailing Address is changed
+   * @Param :  lead : Contains new lead record
+   * @Param : oldLead : Contains old lead record
+   */
+  @TestVisible
+  private Boolean checkMailingAddress(Lead lead, Lead oldLead) {
+    Boolean isMailingAddressChanged = false;
+    if (oldLead != null) {
+      if (
+        lead.stateCode != oldLead.stateCode ||
+        lead.city != oldLead.city ||
+        lead.postalCode != oldLead.postalCode ||
+        lead.street != oldLead.street
+      ) {
+        isMailingAddressChanged = true;
+      }
+    } else {
+      if (
+        lead.stateCode != null &&
+        lead.postalCode != null &&
+        lead.city != null &&
+        lead.street != null
+      ) {
+        isMailingAddressChanged = true;
+      }
+    }
+    return isMailingAddressChanged;
+  }
+
+  /*
+   * Description : This method is used to validate the Residential Address on Lead by Calling EAS Validator Service
+   * @Param :  newlist : Contains trigger.new i.e. all new lead records
+   * @Param : oldlist : Contains trigger.old i.e. all old lead records
+   */
+  @TestVisible
+  private void validateLeadAddress(List<Lead> newList, List<Lead> oldList) {
+    Set<Id> setLeadIds = new Set<Id>();
+    List<String> lstAddressesToValidate = new List<String>();
+    Map<Id, Lead> oldMap = oldList != null ? new Map<Id, Lead>(oldList) : null;
+    for (Lead lead : newList) {
+      Lead oldLead = oldMap != null ? oldMap.get(Lead.Id) : null;
+      if (checkResidentialAddress(lead, oldLead)) {
+        setLeadIds.add(lead.Id);
+        lstAddressesToValidate.add('Residential_Address__c');
+      }
+      if (
+        checkMailingAddress(lead, oldLead) &&
+        !lead.Mailing_Same_As_Residential__c
+      ) {
+        setLeadIds.add(lead.Id);
+        lstAddressesToValidate.add('Address');
+      }
+    }
+    if (
+      !setLeadIds.isEmpty() &&
+      !lstAddressesToValidate.isEmpty() &&
+      !Test.isRunningTest()
+    ) {
+      p = (Promise) new MP_EASAddressValidatorService()
+        .execute(setLeadIds, 'Lead', lstAddressesToValidate, true, p)
+        .get('instance');
+    }
+  }
+
+  /*
+   * Description : This method is used to publish a Platform Event when a residential state is changed
+   * @Param :  newlist : Contains trigger.new i.e. all new lead records
+   * @Param : oldlist : Contains trigger.old i.e. all old lead records
+   */
+  @TestVisible
+  private void publishResidentialStateChangePE(
+    List<Lead> newList,
+    List<Lead> oldList
+  ) {
+    Map<Id, Lead> oldMap = new Map<Id, Lead>(oldList);
+    List<Residential_State_Change_Event__e> stateChangeEvents = new List<Residential_State_Change_Event__e>();
+    for (Lead lead : newList) {
+      Lead oldLead = oldMap.get(lead.Id);
+
+      if (
+        lead.Residential_Address__StateCode__s !=
+        oldLead.Residential_Address__StateCode__s
+      ) {
+        Residential_State_Change_Event__e stateChangeEvent = new Residential_State_Change_Event__e(
+          Record_Ids__c = lead.Id
+        );
+        stateChangeEvents.add(stateChangeEvent);
+      }
+    }
+
+    if (!stateChangeEvents.isEmpty()) {
+      Database.SaveResult[] results = EventBus.publish(stateChangeEvents);
+    }
+  }
+
+  @TestVisible
+  @SuppressWarnings('PMD.ApexCRUDViolation')
+  private void relateVoiceCallToLead(List<Lead> newList) {
+    List<VoiceCall> listVC = new List<VoiceCall>();
+    for (Lead lead : newList) {
+      if (String.isNotBlank(lead.Voice_Call_Id__c)) {
+        VoiceCall vc = new VoiceCall();
+        vc.Id = lead.Voice_Call_Id__c;
+        vc.RelatedRecordId = lead.Id;
+        listVC.add(vc);
+      }
+    }
+    update listVC;
+  }
+
+  /*
+   * Description : This method is used to copy Permission to Contact from Lead to Account when lead is converted
+   * @Param :  convertedLeads : Contains new lead record
+   */
+  @TestVisible
+  private void copyPermissionToContactToAccount(List<Lead> convertedLeads) {
+    try {
+      uow = new fflib_SObjectUnitOfWork(
+        new List<Schema.SObjectType>{ Permission_to_Contact__c.SObjectType }
+      );
+      List<Id> leadIdList = new List<Id>();
+      Map<Id, Id> leadIdToAccountIdMap = new Map<Id, Id>();
+      List<Permission_to_Contact__c> permissionToContactList = new List<Permission_to_Contact__c>();
+      for (Lead ld : convertedLeads) {
+        leadIdList.add(ld.id);
+        leadIdToAccountIdMap.put(ld.id, ld.ConvertedAccountId);
+      }
+      if (!Test.isRunningTest() && !leadIdList.isEmpty()) {
+        lstPermisssionToContact = new List<sObject>(
+          Database.query(
+            'SELECT id,Lead__c,Person_Account__c FROM Permission_to_Contact__c WHERE Lead__c IN :leadIdList'
+          )
+        );
+      }
+      if (!lstPermisssionToContact.isEmpty()) {
+        for (
+          Permission_to_Contact__c ptc : (List<Permission_to_Contact__c>) lstPermisssionToContact
+        ) {
+          if (leadIdToAccountIdMap.containskey(ptc.Lead__c)) {
+            ptc.Person_Account__c = leadIdToAccountIdMap.get(ptc.Lead__c);
+            permissionToContactList.add(ptc);
+          }
+        }
+      }
+      if (!permissionToContactList.isEmpty()) {
+        uow.registerDirty(permissionToContactList);
+        uow.commitWork();
+      }
+    } catch (Exception e) {
+      LogService.error(e, 'copyPermissionToContactToLead');
+    }
+  }
+
+  /*
+   * Description : This method is used to execute the Lead Routing logic added as part of US-5948747
+   * @Param :  newlist : Contains trigger.new i.e. all new lead records
+   * @Param : oldlist : Contains trigger.old i.e. all old lead records
+   */
+  @TestVisible
+  private void executeLeadRouting(List<Lead> newList, List<Lead> oldList) {
+    list<Lead> leadList = new List<Lead>();
+    Map<Id, Lead> oldMap = oldList != null ? new Map<Id, Lead>(oldList) : null;
+
+    for (Lead ld : newList) {
+      Lead oldLead = oldMap != null ? oldMap.get(ld.Id) : null;
+      if (
+        (oldlead == null && ld.Lead_Routing__c == true) ||
+        (oldLead != null &&
+        ld.Lead_Routing__c == true &&
+        oldLead.Lead_Routing__c == false)
+      ) {
+        leadList.add(ld);
+      }
+      /*if(ld.Lead_Routing__c == true && ld.Residential_Validated__c == true && (ld.Residential_County__c != oldLead.Residential_County__c)){
+leadList.add(ld);
+}*/
+    }
+
+    if (!leadList.isEmpty()) {
+      MP_LeadRoutingController.routeLeads(leadList);
+    }
+  }
+
+  /*
+   * Description : This method is used to update DNC fields logic added as part of US-7278121
+   * @Param :  newlist : Contains trigger.new i.e. all new lead records
+   * @Param : oldlist : Contains trigger.old i.e. all old lead records
+   */
+  public void manipulateDNCValues(List<Lead> newList, List<Lead> oldList) {
+    Map<Id, Lead> oldMap = (oldList == null ||
+      oldList.size() == 0)
+      ? null
+      : new Map<Id, Lead>(oldList);
+    for (Lead newLead : newList) {
+      if (
+        (!newLead.DoNotCall && oldMap == null) ||
+        (oldMap != null &&
+        !newLead.DoNotCall &&
+        newLead.DoNotCall != oldMap.get(newLead.Id).DoNotCall)
+      ) {
+        newLead.Do_Not_Call_Expiration_Primary__c = system.today();
+      }
+      if (
+        (!newLead.Do_Not_Call_Secondary__c && oldMap == null) ||
+        (oldMap != null &&
+        !newLead.Do_Not_Call_Secondary__c &&
+        newLead.Do_Not_Call_Secondary__c !=
+        oldMap.get(newLead.Id).Do_Not_Call_Secondary__c)
+      ) {
+        newLead.Do_Not_Call_Expiration_Secondary__c = system.today();
+      }
+    }
+  }
+
+  /*
+   * Description : This method is used to validate the Residential Address on Account by Calling EAS Validator Service
+   * @Param :  newlist : Contains trigger.new i.e. all new account records
+   * @Param : oldlist : Contains trigger.old i.e. all old acount records
+   */
+  @TestVisible
+  private void leadEcrAPIOnCreate(List<Lead> newList) {
+    Map<Id, Set<String>> eligibleIdMap = new Map<Id, Set<String>>();
+    for (Lead leadRec : newList) {
+      Set<String> typeSet = new Set<String>();
+      if (leadRec.DoNotCall) {
+        typeSet.add('Primary Details');
+      }
+      if (leadRec.Do_Not_Call_Secondary__c) {
+        typeSet.add('Secondary Details');
+      }
+      if (typeSet.size() > 0) {
+        eligibleIdMap.put(leadRec.Id, typeSet);
+      }
+    }
+    if (eligibleIdMap != null && !eligibleIdMap.isEmpty()) {
+      p = (Promise) new MP_LeadEcrAPIService()
+        .execute(eligibleIdMap, true, p)
+        .get('instance');
+    }
+  }
+
+  @TestVisible
+  private void leadEcrAPIonUpdate(List<Lead> newList, List<Lead> oldList) {
+    Map<Id, Lead> oldMap = new Map<Id, Lead>(oldList);
+    Map<Id, Set<String>> eligibleIdMap = new Map<Id, Set<String>>();
+    for (Lead leadRec : newList) {
+      Set<String> typeSet = new Set<String>();
+      if (leadRec.DoNotCall != oldMap.get(leadRec.Id).DoNotCall) {
+        typeSet.add('Primary Details');
+      }
+      if (
+        leadRec.Do_Not_Call_Secondary__c !=
+        oldMap.get(leadRec.Id).Do_Not_Call_Secondary__c
+      ) {
+        typeSet.add('Secondary Details');
+      }
+      if (typeSet.size() > 0) {
+        eligibleIdMap.put(leadRec.Id, typeSet);
+      }
+    }
+    if (eligibleIdMap != null && !eligibleIdMap.isEmpty()) {
+      p = (Promise) new MP_LeadEcrAPIService()
+        .execute(eligibleIdMap, true, p)
+        .get('instance');
+    }
+  }
+
+  @TestVisible
+  private static MP_TerritoryAlignment_Singleton terrAlignTestInstance = MP_TerritoryAlignment_Singleton.getInstance();
+
+  @TestVisible
+  private void populateSalesAttributesOnLead(
+    List<Lead> newList,
+    List<Lead> oldList
+  ) {
+    try {
+      Set<String> countyStateSet = new Set<String>();
+      if (oldList == null && newList != null) {
+        for (Integer i = 0; i < newList.size(); i++) {
+          if (
+            newList[i].Residential_Validated__c &&
+            String.isNotBlank(newList[i].Residential_County__c) &&
+            String.isNotBlank(newList[i].Residential_Address__StateCode__s)
+          ) {
+            String countyStateNormalizedValue = ((String.isBlank(
+                  newList[i].Residential_County__c
+                )
+                ? ''
+                : newList[i].Residential_County__c) +
+              ', ' +
+              (String.isBlank(newList[i].Residential_Address__StateCode__s)
+                ? ''
+                : newList[i].Residential_Address__StateCode__s))
+              .toLowerCase();
+            countyStateSet.add(countyStateNormalizedValue);
+          }
+        }
+      } else if (oldList != null && newList != null) {
+        for (Integer i = 0; i < newList.size(); i++) {
+          if (
+            (newList[i].Residential_Validated__c !=
+            oldList[i].Residential_Validated__c &&
+            newList[i].Residential_Validated__c &&
+            String.isNotBlank(newList[i].Residential_County__c) &&
+            String.isNotBlank(newList[i].Residential_Address__StateCode__s)) ||
+            (newList[i].Line_of_Business__c != oldList[i].Line_of_Business__c)
+          ) {
+            String countyStateNormalizedValue = ((String.isBlank(
+                  newList[i].Residential_County__c
+                )
+                ? ''
+                : newList[i].Residential_County__c) +
+              ', ' +
+              (String.isBlank(newList[i].Residential_Address__StateCode__s)
+                ? ''
+                : newList[i].Residential_Address__StateCode__s))
+              .toLowerCase();
+            countyStateSet.add(countyStateNormalizedValue);
+          }
+          if (
+            !(String.isBlank(newList[i].Residential_County__c) &&
+            String.isBlank(newList[i].Residential_Address__StateCode__s))
+          ) {
+            String countyStateNormalizedValue = ((String.isBlank(
+                  newList[i].Residential_County__c
+                )
+                ? ''
+                : newList[i].Residential_County__c) +
+              ', ' +
+              (String.isBlank(newList[i].Residential_Address__StateCode__s)
+                ? ''
+                : newList[i].Residential_Address__StateCode__s))
+              .toLowerCase();
+            countyStateSet.add(countyStateNormalizedValue);
+          }
+        }
+      }
+      Map<String, List<Territory_Alignment__c>> mapCountyStateKeyListTerrAlignment = new Map<String, List<Territory_Alignment__c>>();
+      if (!Test.isRunningtest()) {
+        new MP_TerritoryAlignment_Selector(countyStateSet);
+      }
+      for (
+        Territory_Alignment__c terrAlign : MP_TerritoryAlignment_Singleton.getInstance()
+          .territoryAlignmentByCountyState
+      ) {
+        String key = terrAlign.County_and_State__r.CountyState__c
+          ?.toLowerCase();
+        if (mapCountyStateKeyListTerrAlignment.containsKey(key)) {
+          mapCountyStateKeyListTerrAlignment.get(key).add(terrAlign);
+        } else {
+          mapCountyStateKeyListTerrAlignment.put(
+            key,
+            new List<Territory_Alignment__c>{ terrAlign }
+          );
+        }
+        key = ((String.isBlank(terrAlign.County_and_State__r.County__c)
+            ? ''
+            : terrAlign.County_and_State__r.County__c) +
+          ', ' +
+          (String.isBlank(terrAlign.County_and_State__r.State__c)
+            ? ''
+            : terrAlign.County_and_State__r.State__c))
+          .toLowerCase();
+        if (mapCountyStateKeyListTerrAlignment.containsKey(key)) {
+          mapCountyStateKeyListTerrAlignment.get(key).add(terrAlign);
+        } else {
+          mapCountyStateKeyListTerrAlignment.put(
+            key,
+            new List<Territory_Alignment__c>{ terrAlign }
+          );
+        }
+      }
+      if (oldList == null && newList != null) {
+        for (Integer i = 0; i < newList.size(); i++) {
+          String countyStateNormalizedValue = ((String.isBlank(
+                newList[i].Residential_County__c
+              )
+              ? ''
+              : newList[i].Residential_County__c) +
+            ', ' +
+            (String.isBlank(newList[i].Residential_Address__StateCode__s)
+              ? ''
+              : newList[i].Residential_Address__StateCode__s))
+            .toLowerCase();
+          if (
+            mapCountyStateKeyListTerrAlignment.containsKey(
+              countyStateNormalizedValue
+            )
+          ) {
+            Boolean found = false;
+            for (
+              Territory_Alignment__c terrAlign : mapCountyStateKeyListTerrAlignment.get(
+                countyStateNormalizedValue
+              )
+            ) {
+              if (
+                (String.isNotBlank(newList[i].Line_of_Business__c) &&
+                terrAlign.Service_Territory__r.Line_of_Business__c ==
+                newList[i].Line_of_Business__c) ||
+                (String.isBlank(newList[i].Line_of_Business__c) &&
+                terrAlign.Service_Territory__r.Line_of_Business__c ==
+                MP_ApexContantsClass.humanaLabel)
+              ) {
+                if (terrAlign.County_and_State__r.SplitCounty__c) {
+                  if (
+                    terrAlign.Zip__r.Name ==
+                    newList[i].Residential_Address__PostalCode__s
+                  ) {
+                    newList[i].Service_Territory__c = terrAlign
+                      .Service_Territory__c;
+                    found = true;
+                    break;
+                  }
+                } else {
+                  newList[i].Service_Territory__c = terrAlign
+                    .Service_Territory__c;
+                  found = true;
+                }
+              }
+            }
+            if (!found) {
+              newList[i].Service_Territory__c = null;
+            }
+          }
+        }
+      } else if (oldList != null && newList != null) {
+        for (Integer i = 0; i < newList.size(); i++) {
+          String countyStateNormalizedValue = ((String.isBlank(
+                newList[i].Residential_County__c
+              )
+              ? ''
+              : newList[i].Residential_County__c) +
+            ', ' +
+            (String.isBlank(newList[i].Residential_Address__StateCode__s)
+              ? ''
+              : newList[i].Residential_Address__StateCode__s))
+            .toLowerCase();
+          if (
+            mapCountyStateKeyListTerrAlignment.containsKey(
+              countyStateNormalizedValue
+            )
+          ) {
+            Boolean found = false;
+            for (
+              Territory_Alignment__c terrAlign : mapCountyStateKeyListTerrAlignment.get(
+                countyStateNormalizedValue
+              )
+            ) {
+              if (
+                (String.isNotBlank(newList[i].Line_of_Business__c) &&
+                terrAlign.Service_Territory__r.Line_of_Business__c ==
+                newList[i].Line_of_Business__c) ||
+                (String.isBlank(newList[i].Line_of_Business__c) &&
+                terrAlign.Service_Territory__r.Line_of_Business__c ==
+                MP_ApexContantsClass.humanaLabel)
+              ) {
+                if (terrAlign.County_and_State__r.SplitCounty__c) {
+                  if (
+                    terrAlign.Zip__r.Name ==
+                    newList[i].Residential_Address__PostalCode__s
+                  ) {
+                    newList[i].Service_Territory__c = terrAlign
+                      .Service_Territory__c;
+                    found = true;
+                    break;
+                  }
+                } else {
+                  newList[i].Service_Territory__c = terrAlign
+                    .Service_Territory__c;
+                  found = true;
+                }
+              }
+            }
+            if (!found) {
+              newList[i].Service_Territory__c = null;
+            }
+          } else {
+            newList[i].Service_Territory__c = null;
+          }
+          if (!newList[i].Residential_Validated__c) {
+            newList[i].Service_Territory__c = null;
+          }
+        }
+      }
+    } catch (Exception e) {
+      LogService.error(e, 'populateSalesAttributesOnLead');
+    }
+  }
+  @TestVisible
+  private void processOwnerChangeTrail(List<Lead> newList, List<Lead> oldList) {
+    MP_SalesAttributeCalculationHelper.processOwnerChangeTrail(
+      newList,
+      oldList
+    );
+  }
+  @TestVisible
+  private void processLeadConversionTrail(
+    List<Lead> newList,
+    List<Lead> oldList
+  ) {
+    MP_SalesAttributeCalculationHelper.processLeadConversionTrail(
+      newList,
+      oldList
+    );
+  }
+
+  @TestVisible
+  private static MP_ServiceResource_Singleton serviceResourceTestInstance = MP_ServiceResource_Singleton.getInstance();
+
+  @TestVisible
+  private void calculateRoutingAttributes(
+    List<Lead> newList,
+    List<Lead> oldList
+  ) {
+    MP_SalesAttributeCalculationHelper.calculateRoutingAttributes(
+      newList,
+      oldList
+    );
+  }
+  public class RelationshipInputDTO {
+    @InvocableVariable(required=true)
+    public Id accountId;
+    @InvocableVariable(required=true)
+    public Id relatedAccountId;
+    @InvocableVariable(required=true)
+    public String roleName;
+    @InvocableVariable(required=false)
+    public Date startDate;
+    @InvocableVariable(required=false)
+    public Date endDate;
+  }
+
+  public class RelationshipOutputDTO {
+    @InvocableVariable(label='Records for Output')
+    public Id ccrId;
+    @InvocableVariable
+    public Boolean success;
+    @InvocableVariable
+    public String message;
+  }
+}
