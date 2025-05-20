@@ -1,0 +1,63 @@
+✅ SECAPI Scan - Callouts Summary for Dev Team
+🔹 Callout 1 – Start SAST and SCA Scans
+Detail	Description
+Purpose	Start the SAST or SCA security scans
+HTTP Method	POST
+API URL	/start/{AppId}
+Apex Methods	- secAPIScan(String copadoUserStoryId) (for SAST)
+- SCAScan(String copadoUserStoryId) (for SCA)
+Authorization	Named Credential:
+- SecAPI_SAST_Scan (SAST)
+- SecAPI_SCA_Scan (SCA)
+Header includes:
+- X-Api-Key: {!$Credential.Password}
+- userName: {!$Credential.Username}
+- Content-Type: application/json
+
+🔹 Callout 2 – Get Scan Status
+Detail	Description
+Purpose	Check current status of the scan
+HTTP Method	GET
+API URL	/status/{ScanId}
+Apex Methods	- runSecAPIStatusCheck(String statusURL, String usId) (SAST)
+- runSCAStatusCheck(String statusURL, String usId) (SCA)
+Authorization	Same as Callout 1
+(Uses same Named Credential + headers)
+
+🔹 Callout 2.5 – Get Scorecard
+Detail	Description
+Purpose	Get detailed scan results (Critical, High, Medium, Low counts)
+HTTP Method	GET
+API URL	/score/{ScoreCardId}
+Apex Methods	- getSECAPIScoreCard(String scoreCardURL, String userStoryId) (SAST)
+- getSCAScoreCard(String scoreCardURL, String userStoryId) (SCA)
+Authorization	Same Named Credential and headers as before
+
+🔹 Callout 3 – Parse Score from Scorecard (inside Callout 2.5)
+Detail	Description
+Purpose	Read Critical, High, Medium, Low scores from scorecard JSON
+Handled In	- getSECAPIScoreCard()
+- getSCAScoreCard()
+Parsing Class	SECAPIParser
+
+🔐 Headers Used (for all callouts)
+http
+Copy
+Edit
+X-Api-Key: {!$Credential.Password}
+userName: {!$Credential.Username}
+Content-Type: application/json
+EnterpriseSuite: {!$Label.EnterpriseSuite}
+EnterpriseValue: {!$Label.EnterpriseValue}
+🧠 Notes
+All calls use Named Credentials, so the API Key and user/password are not hardcoded.
+
+Callout 1 starts the scan.
+
+Callout 2 checks if the scan is finished.
+
+Callout 2.5 gets full scan results.
+
+Callout 3 is part of 2.5 — it extracts the score values.
+
+Let me know if you want this as a Word or PDF file to send to your team.
