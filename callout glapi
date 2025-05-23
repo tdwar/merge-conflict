@@ -1,0 +1,38 @@
+ GLAPI Callouts
+GLAPI is triggered after SecAPI scorecard retrieval, passed internally within getSECAPISecurityScoreCard() or similar methods.
+
+A. 🧪 Dry Run Callout
+Detail	Description
+Method	POST (assumed)
+Apex Trigger	After SECAPI scan results
+Purpose	Runs a security validation without enforcing it
+Authorization	Uses the same headers (Named Credential or Custom Auth)
+
+B. 🚀 Actual Run Callout
+Detail	Description
+Method	POST
+Trigger	After passing dry run or final scan
+Purpose	Enforces security scan results
+Authorization	Same as above
+
+C. 📇 GLAPI Registration Callout
+Detail	Description
+Method	POST
+Endpoint	Depends on Glapi_Callout_Settings__c values
+Payload Example	
+
+json
+Copy
+Edit
+{
+  "appId": "APPSVC12345",
+  "scoreCard": {
+    "critical": 1,
+    "high": 2,
+    "medium": 3,
+    "low": 0
+  },
+  "scanType": "SAST",
+  "status": "PASS"
+}
+📌 Notes for Implement
