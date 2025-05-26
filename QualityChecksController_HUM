@@ -1,0 +1,1511 @@
+/******************************************************************************************************************************
+Apex Class Name  : QualityChecksController_HUM
+Version          : 1.0 
+Created Date     : 01/06/2021
+Function         : 
+
+Modification Log :
+* Developer                       Date                 Description
+* -----------------------------------------------------------------------------------------------------------------------------------------------------------------------                
+* Vaibhav Tripathi               01/06/2021          This controller call from Aura component and used to do Quality CHecks with 3 different sequential callouts for checkmarx scan.
+* Krishna Prasad                 09/27/2022          Added new methods to handle EAR workflow.
+* Krishna Prasad                 03/06/2023          Added new methods to handle Backup Snapshot.
+***************************************************************************************************************************************************************************/
+
+public with sharing class QualityChecksController_HUM {
+    
+    public class GlapiResponse {
+        @AuraEnabled public Integer CountOfAppServiceId {get;set;}
+        @AuraEnabled public List<string> ListOfScanResults {get;set;}
+          @AuraEnabled public string ErrorMessage {get;set;}
+        
+  }
+
+    @AuraEnabled
+    public static copado__Release__c getReleaseObjectDetails(String releaseId) {
+        copado__Release__c releaseRecords = new copado__Release__c();
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && 
+           Schema.sObjectType.copado__User_Story__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Current_Glapi_Status__c.isAccessible() &&
+           Schema.sObjectType.copado__Release__c.fields.RecordTypeId.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Incident_Number__c.isAccessible() &&
+           Schema.sObjectType.copado__Release__c.fields.Planned_Start_Date__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible() &&
+           Schema.sObjectType.copado__User_Story__c.fields.copado__Environment__c.isAccessible() && Schema.sObjectType.copado__User_Story__c.fields.copado__Project__c.isAccessible()){
+            releaseRecords = [SELECT id,Current_Glapi_Status__c,RecordType.DeveloperName,Incident_Number__c,Planned_Start_Date__c,
+                              (SELECT id, Source_Org__c,copado__Project__r.SNOW_APPSVCID__c,copado__Project__r.SNOWTemplate_Id__c,copado__Environment__r.Next_Environment__c FROM copado__User_Stories__r) FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+            if(releaseRecords != null && releaseRecords.copado__User_Stories__r.size() == 0){
+                throw new AuraHandledException('Please assign any user story to this release record before proceed for Quality Checks');
+            }
+               
+               if(releaseRecords!=null && releaseRecords.RecordType.DeveloperName=='Emergency_Application_Release'){
+                   boolean isAppSerUnique = true;
+                   boolean isHotFixEnv=true;
+                   String appSevId;
+                   for(copado__User_Story__c useStory: releaseRecords.copado__User_Stories__r){
+                       if(appSevId==null){
+                           appSevId=useStory.copado__Project__r.SNOW_APPSVCID__c;
+                           isAppSerUnique=true;
+                       }else if(isAppSerUnique && appSevId!=null && appSevId==useStory.copado__Project__r.SNOW_APPSVCID__c){
+                           isAppSerUnique=true;
+                       }else{
+                           isAppSerUnique=false;
+                       }
+                       
+                       //if(isHotFixEnv && useStory.copado__Environment__r.Next_Environment__c=='HotFix'){
+                       /*if(isHotFixEnv && useStory.Source_Org__c = Hotfix){
+                           isHotFixEnv = true;
+                       }else{
+                           isHotFixEnv = false;
+                       } */
+                  
+                   if(useStory.Source_Org__c.toLowerCase().contains(System.Label.Hotfix_Keyword)){
+                       isHotFixEnv = true;
+                       }else{
+                           isHotFixEnv = false;
+                       } 
+                  
+               }
+                   if(!isAppSerUnique){
+                       throw new AuraHandledException('For Emergency AR Release, User Stories for a HotFix Release should map back to a Single APPSVCID with an Active Priority Incident.');
+                   }
+                   if(!isHotFixEnv){
+                       throw new AuraHandledException('For Emergency AR Release, User Stories should come from a HotFix environment only.');
+                   }
+               }
+        }
+        else{
+            throw new AuraHandledException('Users do not have appropriate access');
+        }
+        return releaseRecords;
+        
+    }
+    
+    @AuraEnabled
+    public static String generateReleaseLogs(String releaseId) {
+        system.debug('releaseId = '+releaseId);
+        List<copado__Release__c> lstReleaseToUpdate =  new List<copado__Release__c>();
+        List<Release_Certification_Log__c> lstReleaseLogsToUpdate =  new List<Release_Certification_Log__c>();
+        List<copado__User_Story__c> lstUserStroryToUpdate = new List<copado__User_Story__c>();
+        Map<String,copado__User_Story__c> mapUserStroryToUpdate = new Map<String, copado__User_Story__c>();
+        List<Release_Certification_Log__c> lstReleaseLogs = new List<Release_Certification_Log__c>();
+        Map<String,String> mapAppIdwithWorkItems =  new Map<String,String>();
+        Map<String,List<copado__User_Story__c>> appServiceUserStoriesMap = new Map<String,List<copado__User_Story__c>>();
+        Map<String,String> MapAppIdWithAzureItems =  new Map<String,String>();
+        Map<String,String> MapAppIdWithTemplateId = new Map<String,String>();
+        List<Release_Certification_Log__c> lstRCL = new List<Release_Certification_Log__c>();
+        
+        try{
+            if(string.isNotEmpty(releaseId) && Schema.sObjectType.Release_Certification_Log__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isAccessible()){
+                lstReleaseLogs = [SELECT id,Status__c, SNOW_APPSVCID__c FROM Release_Certification_Log__c where Release__c =:releaseId WITH SECURITY_ENFORCED];
+            }
+            system.debug('@@@ rcl' + lstReleaseLogs);
+            if(!lstReleaseLogs.isEmpty()){
+                for(Release_Certification_Log__c rcl :lstReleaseLogs){
+                    if(rcl != null){
+                        lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=rcl.Id,Status__c ='Draft',Active__c=false));
+                    }
+                }
+            }
+            if(!lstReleaseLogsToUpdate.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isUpdateable()){
+                Update lstReleaseLogsToUpdate;
+            }
+            
+            String azureWorkItems ='';
+            String SnowAppId = '';
+            Set<Id> packageVersIds = new set<Id>();
+            if(String.isNotEmpty(releaseId)){
+                List<copado__Release__c> lstreleaseRecords = new  List<copado__Release__c>();
+                if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.copado__User_Story__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Artifact_Id__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible()){
+                    lstreleaseRecords = [SELECT Id,Artifact_Id__c,(SELECT id,copado__Is_Bundle__c,copado__Project__r.SNOW_APPSVCID__c,External_Id__c,copado__Project__r.SNOWTemplate_Id__c FROM copado__User_Stories__r) FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+                }
+                
+                
+                if(!lstreleaseRecords.isEmpty()){
+                    for(copado__Release__c cr : lstreleaseRecords){
+                        SnowAppId = '';
+                        
+                        for(copado__User_Story__c us : cr.copado__User_Stories__r){
+                            if(us.copado__Is_Bundle__c){
+                                packageVersIds.add(us.Id);
+                            }else{
+                                if(!appServiceUserStoriesMap.containsKey(us.copado__Project__r.SNOW_APPSVCID__c)){
+                                    appServiceUserStoriesMap.put(us.copado__Project__r.SNOW_APPSVCID__c, new List<copado__User_Story__c>{us});
+                                }
+                                else{
+                                    appServiceUserStoriesMap.get(us.copado__Project__r.SNOW_APPSVCID__c).add(us);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                Set<Id> bundleUSIds = new set<Id>();
+                List<copado__Bundled_Story__c> bundledStoryList = new List<copado__Bundled_Story__c>();
+                List<copado__Artifact_Version__c> packageVersionList = new List<copado__Artifact_Version__c>();
+                if(Schema.sObjectType.copado__Artifact_Version__c.isQueryable() && Schema.sObjectType.copado__Artifact_Version__c.isAccessible() && Schema.sObjectType.copado__Artifact_Version__c.fields.copado__User_Story__c.isAccessible() && Schema.sObjectType.copado__Artifact_Version__c.fields.Id.isAccessible()){
+                    packageVersionList = [SELECT id,copado__User_Story__c FROM copado__Artifact_Version__c 
+                                          WHERE copado__User_Story__c IN : packageVersIds];
+                }
+                if(!packageVersionList.isEmpty() && Schema.sObjectType.copado__Bundled_Story__c.isQueryable() && Schema.sObjectType.copado__Bundled_Story__c.isAccessible() && Schema.sObjectType.copado__Bundled_Story__c.fields.copado__Package_Version__c.isAccessible() && Schema.sObjectType.copado__Bundled_Story__c.fields.Id.isAccessible()){
+                    bundledStoryList = [SELECT id,name,copado__Package_Version__c,copado__User_Story__c,copado__User_Story__r.name 
+                                        FROM copado__Bundled_Story__c
+                                        WHERE copado__Package_Version__c IN :packageVersionList];
+                }
+                
+                if(!bundledStoryList.isEmpty() && Schema.sObjectType.copado__User_Story__c.isQueryable() && Schema.sObjectType.copado__User_Story__c.isAccessible() && Schema.sObjectType.copado__User_Story__c.fields.copado__Project__c.isAccessible() && Schema.sObjectType.copado__User_Story__c.fields.Id.isAccessible()){
+                    for(copado__Bundled_Story__c bundleUS :bundledStoryList){
+                        bundleUSIds.add(bundleUS.copado__User_Story__c);
+                    }
+                    List<copado__User_Story__c> userStoryLst = [SELECT id,copado__Project__r.SNOW_APPSVCID__c,External_Id__c,
+                                                                copado__Project__r.SNOWTemplate_Id__c 
+                                                                FROM copado__User_Story__c
+                                                                WHERE ID IN: bundleUSIds];
+                    
+                    for(copado__User_Story__c usRec: userStoryLst){
+                        if(!appServiceUserStoriesMap.containsKey(usRec.copado__Project__r.SNOW_APPSVCID__c)){
+                            appServiceUserStoriesMap.put(usRec.copado__Project__r.SNOW_APPSVCID__c, new List<copado__User_Story__c>{usRec});
+                        }
+                        else{
+                            appServiceUserStoriesMap.get(usRec.copado__Project__r.SNOW_APPSVCID__c).add(usRec);
+                        }
+                    }
+                }
+                
+                for(List<copado__User_Story__c> lstUserStories : appServiceUserStoriesMap.values()){
+                    SnowAppId = '';
+                    azureWorkItems = '';
+                    String snowTemplateId = '';
+                    for(copado__User_Story__c us : lstUserStories){
+                        if(String.isNotEmpty(us.copado__Project__r.SNOW_APPSVCID__c)){
+                            SnowAppId = us.copado__Project__r.SNOW_APPSVCID__c;
+                        }
+                        if(us != null && String.isNotEmpty(us.External_Id__c)){
+                            azureWorkItems = azureWorkItems + ','+us.External_Id__c;
+                        }
+                        if(us != null && String.isNotEmpty(us.copado__project__r.SNOWTemplate_Id__c) && String.isBlank(snowTemplateId)){
+                            snowTemplateId = us.copado__project__r.SNOWTemplate_Id__c;
+                        }
+                        
+                    }
+                    MapAppIdWithAzureItems.put(SnowAppId,azureWorkItems);
+                    MapAppIdWithTemplateId.put(SnowAppId,snowTemplateId);
+                    
+                }
+                
+                if(!appServiceUserStoriesMap.isEmpty()){
+                    for(String str : appServiceUserStoriesMap.keySet()){
+                        if(String.isNotEmpty(str)){ 
+                            if (
+                                Schema.sObjectType.Release_Certification_Log__c.isCreateable() &&
+                                Schema.sObjectType.Release_Certification_Log__c.fields.Release__c.isCreateable() &&
+                                Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_APPSVCID__c.isCreateable() &&
+                                Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isCreateable() &&
+                                Schema.sObjectType.Release_Certification_Log__c.fields.SNOWTemplate_Id__c.isCreateable() &&
+                                Schema.sObjectType.Release_Certification_Log__c.fields.Callout_Status__c.isCreateable() &&
+                                Schema.sObjectType.Release_Certification_Log__c.fields.Azure_Work_Items__c.isCreateable()
+                            ) {
+                                lstRCL.add(new Release_Certification_Log__c(Release__c=releaseId,SNOW_APPSVCID__c=str,Status__c='Active',SNOWTemplate_Id__c=MapAppIdWithTemplateId.get(str),Callout_Status__c='Build Id Generation Passed',
+                                                                            Azure_Work_Items__c=MapAppIdWithAzureItems.get(str).removeStart(',')));
+                            }
+                        } else {
+                            System.debug('FLS error: Missing create permissions on some fields in Release_Certification_Log__c.');
+                        }
+                    }
+                    
+                }
+            }
+            if(!lstRCL.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isCreateable()){
+                insert lstRCL;
+            }
+            
+            system.debug('appServiceUserStoriesMap'+appServiceUserStoriesMap);
+            for(Release_Certification_Log__c rcl : [Select id,SNOW_APPSVCID__c,BuildId__c from Release_Certification_Log__c where Id IN :lstRCL]){
+                
+                if(rcl.SNOW_APPSVCID__c != null){
+                    for(copado__User_Story__c cu : appServiceUserStoriesMap.get(rcl.SNOW_APPSVCID__c)){
+                        lstUserStroryToUpdate.add(new copado__User_Story__c(Id=cu.Id,Release_Certification_Log__c=rcl.Id));
+                    }
+                }
+                
+            }
+            
+            if(!lstUserStroryToUpdate.isEmpty() && Schema.sObjectType.copado__User_Story__c.isUpdateable()){
+                update lstUserStroryToUpdate;
+            }
+        }catch(Exception e){
+            system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+        }
+        if(!lstReleaseToUpdate.isEmpty() && Schema.sObjectType.copado__Release__c.isUpdateable()){
+            Update lstReleaseToUpdate;
+        }
+        
+        return null;
+    }
+    
+    @AuraEnabled
+    public static String runGrafeasCallout(String releaseId) {
+        String grafeasResults = '';
+        Boolean IsCodeCoverageFailed = false;
+        String CodeCoverage = '';
+        
+        HTTPResponse res = new HTTPResponse();
+        List<copado__Release__c> lstReleaseToUpdate =  new List<copado__Release__c>();
+        List<Release_Certification_Log__c> lstReleaseLogsToUpdate =  new List<Release_Certification_Log__c>();
+        Map<String,Release_Certification_Log__c> MapAppServiceIdWithReleaseLog = new Map<String,Release_Certification_Log__c>();
+        List<copado__Release__c> lstreleaseRecord = new List<copado__Release__c>();
+        String body = '';
+        String buildId = '';
+        
+        CodeCoverage = [Select Id,Value__c From Glapi_Callout_Settings__c Where Name = 'GrafeasCodeCoverage' Limit 1].Value__c;
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Artifact_Id__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isAccessible()){
+            lstreleaseRecord = [SELECT id,Artifact_Id__c,(SELECT id,SNOW_APPSVCID__c,Build_Id__c FROM Release_Certification_Logs__r where Status__c=:'Active') FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        }
+        buildId = lstreleaseRecord[0].Artifact_Id__c;
+        for(Release_Certification_Log__c rch : lstreleaseRecord[0].Release_Certification_Logs__r){
+            rch.Build_Id__c = lstreleaseRecord[0].Artifact_Id__c;
+            MapAppServiceIdWithReleaseLog.put(rch.SNOW_APPSVCID__c,rch);
+        }
+        if(!MapAppServiceIdWithReleaseLog.isEmpty()){
+            for(String str : MapAppServiceIdWithReleaseLog.keySet()){
+                try{
+                    body = '{ "AppServiceId" : "'+str+'","Kind":"CODEQUALITY","SourceSystemKeys": {  "UniqueBuildArtifactId": "'+ buildId +'"  },  "CodeQuality": {  "CodeCoverage": "'+CodeCoverage+'" }}';
+                     system.debug('@@@ body' + body);
+                    if(String.isNotBlank(str) && String.isNotBlank(body) ){
+                        res = getGrafeasCalloutResponse('POST',body); 
+                        system.debug('res status code :'+res.getStatusCode());
+                        system.debug('res value :'+res.getBody());
+                        if((res.getStatusCode() == 200 || res.getStatusCode() == 201) && !MapAppServiceIdWithReleaseLog.IsEmpty()){
+                            grafeasResults ='Pass';
+                            lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,Grafeas_Callout_Status__c='Passed',Build_Id__c=buildId,Callout_Status__c='Code Coverage Passed'));
+                        }
+                        else{
+                            IsCodeCoverageFailed = true;
+                            grafeasResults = 'Error occured during Code Coverage Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                            lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,Grafeas_Callout_Status__c='Failed',Error_Message__c=grafeasResults,Callout_Status__c='Code Coverage Failed',Code_Coverage_Error_Message__c=grafeasResults));
+                            
+                        }
+                    }
+                    
+                    
+                    
+                    
+                }catch(Exception e){
+                    system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+                    lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Code Coverage Failed', Quality_Checks_Status__c='Failed'));
+                    lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,Grafeas_Callout_Status__c='Failed',Error_Message__c=grafeasResults,Callout_Status__c='Code Coverage Failed',Code_Coverage_Error_Message__c=e.getMessage()));
+                    
+                }
+            }
+        }
+        if(!IsCodeCoverageFailed){
+            lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Code Coverage Completed', Quality_Checks_Status__c='In-Progress'));
+        }
+        else{
+            lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Code Coverage Failed', Quality_Checks_Status__c='Failed'));
+        }
+        if(!lstReleaseLogsToUpdate.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isUpdateable()){
+            update lstReleaseLogsToUpdate;
+        }
+        if(!lstReleaseToUpdate.isEmpty() && Schema.sObjectType.copado__Release__c.isUpdateable()){
+            Update lstReleaseToUpdate;
+        }
+        return grafeasResults;
+    }
+    
+    @AuraEnabled
+    public static String runSNOWPriorityCallout(String releaseId) {
+        String snowPriorityResults = '';
+        HTTPResponse res = new HTTPResponse();
+        List<copado__User_Story__c> lstUserStroryToUpdate = new List<copado__User_Story__c>();
+        List<copado__Release__c> lstReleaseToUpdate =  new List<copado__Release__c>();
+        List<Release_Certification_Log__c> lstReleaseLogsToInsert =  new List<Release_Certification_Log__c>();
+        List<copado__Release__c> lstreleaseRecord = new List<copado__Release__c>();
+        Map<String,String> MapAppIdWithAzureItems =  new Map<String,String>();
+        Map<String,String> MapAppIdWithTemplateId = new Map<String,String>();
+        
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Incident_Number__c.isAccessible()){
+            lstreleaseRecord = [SELECT id,Incident_Number__c,(SELECT id,External_Id__c,copado__Project__r.SNOW_APPSVCID__c,copado__project__r.SNOWTemplate_Id__c FROM copado__User_Stories__r),
+                                (SELECT id,Build_Id__c,SNOW_APPSVCID__c,Azure_Work_Items__c FROM Release_Certification_Logs__r where Status__c=:'Active') FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        }
+        String incidentNumber = lstreleaseRecord[0].Incident_Number__c;
+        String appSrvID = lstreleaseRecord[0].copado__User_Stories__r[0].copado__Project__r.SNOW_APPSVCID__c;
+        String relLogID = null;
+        try{
+            for(List<copado__User_Story__c> lstUserStories : lstreleaseRecord[0].copado__User_Stories__r){
+                String SnowAppId = '';
+                String azureWorkItems = '';
+                String snowTemplateId = '';
+                for(copado__User_Story__c us : lstUserStories){
+                    if(String.isNotEmpty(us.copado__Project__r.SNOW_APPSVCID__c)){
+                        SnowAppId = us.copado__Project__r.SNOW_APPSVCID__c;
+                    }
+                    if(us != null && String.isNotEmpty(us.External_Id__c)){
+                        azureWorkItems = azureWorkItems + ','+us.External_Id__c;
+                    }
+                    if(us != null && String.isNotEmpty(us.copado__project__r.SNOWTemplate_Id__c) && String.isBlank(snowTemplateId)){
+                        snowTemplateId = us.copado__project__r.SNOWTemplate_Id__c;
+                    }
+                    
+                }
+                MapAppIdWithAzureItems.put(SnowAppId,azureWorkItems);
+                MapAppIdWithTemplateId.put(SnowAppId,snowTemplateId);
+            }
+            
+            relLogID =  !lstreleaseRecord[0].Release_Certification_Logs__r.isEmpty()?lstreleaseRecord[0].Release_Certification_Logs__r.get(0).Id:null;
+            res = getSNOWPriorityCalloutResponse('GET',incidentNumber); 
+            system.debug('res status code :'+res.getStatusCode());
+            system.debug('res value :'+res.getBody());
+            if((res.getStatusCode() == 200 || res.getStatusCode() == 201)){
+                Map<String, object> resBody = (Map<String, object>)JSON.Deserializeuntyped(res.getBody());//{"result": [{"priority": "2 - High"}]}
+                list<object> resObj = (List<object>)resBody.get('result');
+                if(resObj!=null && !resObj.isEmpty()){
+                    Map<String, object> resultMap = (Map<String, object>)resObj.get(0);
+                    String priorityVal = (String)resultMap.get('priority');
+                    if(priorityVal=='0 - Critical' || priorityVal=='1 - Critical' || priorityVal=='2 - High'){
+                        snowPriorityResults ='Pass';
+                        if (Schema.sObjectType.Release_Certification_Log__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Release__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_APPSVCID__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_Priority_Callout_Status__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Callout_Status__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_Priority_Error_Message__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Azure_Work_Items__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOWTemplate_Id__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Change_Order_Error_Message__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_Callout_Status__c.isCreateable()) {
+                        lstReleaseLogsToInsert.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,SNOW_APPSVCID__c=appSrvID,Status__c='Active',SNOW_Priority_Callout_Status__c='Passed',Callout_Status__c='SNOW Priority Passed',SNOW_Priority_Error_Message__c='',Azure_Work_Items__c=MapAppIdWithAzureItems.get(appSrvID).removeStart(','),SNOWTemplate_Id__c=MapAppIdWithTemplateId.get(appSrvID),Change_Order_Error_Message__c='',SNOW_Callout_Status__c=''));
+                            } else {
+                                throw new AuraHandledException('User does not have permission to create Release_Certification_Log__c records or some fields.');
+                            }  
+                        //lstReleaseLogsToInsert.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,SNOW_APPSVCID__c=appSrvID,Status__c='Active',SNOW_Priority_Callout_Status__c='Passed',Callout_Status__c='SNOW Priority Passed',SNOW_Priority_Error_Message__c='',Azure_Work_Items__c=MapAppIdWithAzureItems.get(appSrvID).removeStart(','),SNOWTemplate_Id__c=MapAppIdWithTemplateId.get(appSrvID),Change_Order_Error_Message__c='',SNOW_Callout_Status__c=''));
+                    }else{
+                        //snowPriorityResults = 'Error occured during SNOW Priority Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                    snowPriorityResults = 'Incident is not valid or Incident Priority is not 0/1/2';
+                        if (Schema.sObjectType.Release_Certification_Log__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Release__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_APPSVCID__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_Priority_Callout_Status__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Callout_Status__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_Priority_Error_Message__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Error_Message__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Change_Order_Error_Message__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_Callout_Status__c.isCreateable()) {
+                        lstReleaseLogsToInsert.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,SNOW_APPSVCID__c=appSrvID,Status__c='Active',SNOW_Priority_Callout_Status__c='Passed',Callout_Status__c='SNOW Priority Passed',SNOW_Priority_Error_Message__c='',Azure_Work_Items__c=MapAppIdWithAzureItems.get(appSrvID).removeStart(','),SNOWTemplate_Id__c=MapAppIdWithTemplateId.get(appSrvID),Change_Order_Error_Message__c='',SNOW_Callout_Status__c=''));
+                            } else {
+                                throw new AuraHandledException('User does not have permission to create Release_Certification_Log__c records or some fields.');
+                            } 
+                        //lstReleaseLogsToInsert.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,SNOW_APPSVCID__c=appSrvID,Status__c='Active',SNOW_Priority_Callout_Status__c='Failed',Callout_Status__c='SNOW Priority Failed',Error_Message__c=priorityVal,SNOW_Priority_Error_Message__c=snowPriorityResults,Change_Order_Error_Message__c='',SNOW_Callout_Status__c=''));
+                    }  
+                }else{
+                    //snowPriorityResults = 'Error occured during SNOW Priority Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                  snowPriorityResults = 'Incident is not valid or Incident Priority is not 0/1/2';
+                    if (Schema.sObjectType.Release_Certification_Log__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Release__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_APPSVCID__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_Priority_Callout_Status__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Callout_Status__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_Priority_Error_Message__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Error_Message__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.Change_Order_Error_Message__c.isCreateable() &&
+                            Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_Callout_Status__c.isCreateable()) {
+                        lstReleaseLogsToInsert.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,SNOW_APPSVCID__c=appSrvID,Status__c='Active',SNOW_Priority_Callout_Status__c='Failed',Callout_Status__c='SNOW Priority Failed',Error_Message__c=res.getBody(),SNOW_Priority_Error_Message__c=snowPriorityResults,Change_Order_Error_Message__c='',SNOW_Callout_Status__c=''));
+                   } else {
+                                throw new AuraHandledException('User does not have permission to create Release_Certification_Log__c records or some fields.');
+                            }
+                    //lstReleaseLogsToInsert.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,SNOW_APPSVCID__c=appSrvID,Status__c='Active',SNOW_Priority_Callout_Status__c='Failed',Callout_Status__c='SNOW Priority Failed',Error_Message__c=res.getBody(),SNOW_Priority_Error_Message__c=snowPriorityResults,Change_Order_Error_Message__c='',SNOW_Callout_Status__c=''));
+                }
+            }
+            else{
+                snowPriorityResults = 'Error occured during SNOW Priority Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                lstReleaseLogsToInsert.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,SNOW_APPSVCID__c=appSrvID,Status__c='Active',SNOW_Priority_Callout_Status__c='Failed',Error_Message__c=snowPriorityResults,Callout_Status__c='SNOW Priority Failed',SNOW_Priority_Error_Message__c=snowPriorityResults,Change_Order_Error_Message__c='',SNOW_Callout_Status__c=''));
+            }
+        }catch(Exception e){
+            system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+            snowPriorityResults = 'Error occured during SNOW Priority Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+            lstReleaseLogsToInsert.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,SNOW_APPSVCID__c=appSrvID,Status__c='Active',SNOW_Priority_Callout_Status__c='Failed',Error_Message__c=snowPriorityResults,Callout_Status__c='SNOW Priority Failed',SNOW_Priority_Error_Message__c=e.getMessage(),Change_Order_Error_Message__c='',SNOW_Callout_Status__c=''));
+        }
+        if(snowPriorityResults=='Pass'){
+            lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'SNOW Priority Passed', Quality_Checks_Status__c='In-Progress'));
+        }
+        else{
+            lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'SNOW Priority Failed', Quality_Checks_Status__c='Failed'));
+        }
+        if(!lstReleaseLogsToInsert.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isCreateable()){
+            upsert lstReleaseLogsToInsert;
+        }
+        if(!lstReleaseToUpdate.isEmpty() && Schema.sObjectType.copado__Release__c.isUpdateable()){
+            Update lstReleaseToUpdate;
+        }
+        for(Release_Certification_Log__c rcl : [Select id,SNOW_APPSVCID__c,BuildId__c from Release_Certification_Log__c where Id IN :lstReleaseLogsToInsert]){
+            
+            if(rcl.SNOW_APPSVCID__c != null){
+                for(copado__User_Story__c cu : lstreleaseRecord[0].copado__User_Stories__r){
+                    lstUserStroryToUpdate.add(new copado__User_Story__c(Id=cu.Id,Release_Certification_Log__c=rcl.Id));
+                }
+            }
+        }
+        
+        if(!lstUserStroryToUpdate.isEmpty() && Schema.sObjectType.copado__User_Story__c.isUpdateable()){
+            update lstUserStroryToUpdate;
+        }
+        return snowPriorityResults;
+    }
+    
+    public static HttpResponse getGrafeasCalloutResponse(String requestType, String requestBody){
+        HTTPResponse res = new HTTPResponse();
+        HttpRequest req = new HttpRequest();
+        if(string.isNotBlank(requestBody) && string.isNotBlank(requestType)){
+            try{
+                req.setMethod('POST');
+                req.setBody(requestBody);
+                req.setEndpoint('callout:GrafeasCallout');
+                req.setHeader('userName', '{!$Credential.Username}');
+                req.setHeader('X-Functions-Key','{!$Credential.Password}'); //Basic 9YRgrpgs0bwuO5GsN7w4HtxHy5g9nzL7LboQgx3fRGXOTlNtzlG1Kw==
+                req.setHeader('Content-Type','application/json');
+                Http http = new Http();
+                res = http.send(req);   
+                system.debug(res.getStatusCode()+ ' value of res '+res.getBody());
+            }catch(Exception e){
+                system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+            }
+        }
+        return res;
+    }
+    
+    public static HttpResponse getSNOWPriorityCalloutResponse(String requestType, String incNum){
+        HTTPResponse res = new HTTPResponse();
+        HttpRequest req = new HttpRequest();
+        if(string.isNotBlank(requestType)){
+            try{
+                req.setMethod(requestType);
+                req.setEndpoint('callout:SNOWCallout'+'/table/incident?sysparm_query=number%3D'+incNum+'&sysparm_display_value=true&sysparm_fields=priority');
+                
+                Http http = new Http();
+                res = http.send(req);   
+                system.debug(res.getStatusCode()+ ' value of res '+res.getBody());
+            }catch(Exception e){
+                system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+            }
+        }
+        return res;
+    }
+    
+    @AuraEnabled
+    public static GlapiResponse runGlapiCallout(String releaseId, string calloutType) {
+        GlapiResponse glapiDryResults = new GlapiResponse();
+        GlapiResponse glapiActualResults = new GlapiResponse();
+        Boolean IsDryRunFailed = false;
+        Boolean IsActualRunFailed = false;
+        String glapiRunType = 'true';
+        HTTPResponse res = new HTTPResponse();
+        List<copado__Release__c> lstReleaseToUpdate =  new List<copado__Release__c>();
+        List<Release_Certification_Log__c> lstReleaseLogsToUpdate =  new List<Release_Certification_Log__c>();
+        Map<Id,Release_Certification_Log__c> MapReleaseLogsToUpdate =  new Map<Id,Release_Certification_Log__c>();
+        copado__Release__c releaseRecord = new copado__Release__c();
+        Map<String,Release_Certification_Log__c> MapAppServiceIdWithReleaseLog = new Map<String,Release_Certification_Log__c>();
+        String body = '';
+        String approveToTurn = '';
+        String resultCode = '';
+        string errorMessage = '';
+        String GlapiExecutionId ='';
+        if(String.isNotEmpty(calloutType) && calloutType =='Actual'){
+            glapiRunType = 'false';
+        }
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible()){
+            releaseRecord = [SELECT id,SecurityGrade__c,(SELECT id,Build_Id__c,SNOW_APPSVCID__c,Azure_Work_Items__c FROM Release_Certification_Logs__r where Status__c=:'Active') FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        }
+        for(Release_Certification_Log__c rch : releaseRecord.Release_Certification_Logs__r){
+            if(rch != null && String.isNotEmpty(rch.SNOW_APPSVCID__c)){
+                MapAppServiceIdWithReleaseLog.put(rch.SNOW_APPSVCID__c,rch);
+            }
+        }
+        glapiDryResults.CountOfAppServiceId = MapAppServiceIdWithReleaseLog.size();
+        glapiDryResults.ListOfScanResults = new List<string>();
+        glapiActualResults.CountOfAppServiceId = MapAppServiceIdWithReleaseLog.size();
+        glapiActualResults.ListOfScanResults = new List<string>();
+        for(String str : MapAppServiceIdWithReleaseLog.keySet()){
+            try{
+                List<Integer> azureWorkItemId =  MapAppServiceIdWithReleaseLog.get(str).Azure_Work_Items__c != null ? HSU_UtilsGeneral.convertStringToIntegerArray(MapAppServiceIdWithReleaseLog.get(str).Azure_Work_Items__c) : new List<Integer>{0};
+                body = '{"appServiceId": "'+str+'","tempSecurityScore":"'+releaseRecord.SecurityGrade__c +'", "sourceSystem": "Copado","technology": "Salesforce","submitterEmailAddress": "copadoUser@humana.com","isDryRun": '+glapiRunType+',"emergencyTurn":{},"artifactId": {"uniqueBuildArtifactId": "'+ MapAppServiceIdWithReleaseLog.get(str).Build_Id__c +'"},"traceability":'+JSON.serialize(azureWorkItemId)+'}';
+                system.debug('value of body in Dry-run '+body);
+                if(String.isNotBlank(str) && String.isNotBlank(body) ){
+                    res = getGlapiCalloutResponse('POST',body,null); 
+                    system.debug('res status code :'+res.getStatusCode());
+                    system.debug('res value :'+res.getBody());
+                    JSONParser parser = JSON.createParser(res.getBody());
+                    if(String.isNotEmpty(calloutType) && calloutType =='Dry'){
+                        /*if(res.getStatusCode() == 0 && retryCount <=2 && !MapAppServiceIdWithReleaseLog.IsEmpty()){
+                            retryCount++;
+                            runGlapiCallout(releaseId,'Dry');
+                        }*/
+                        if(res != null && res.getStatusCode() == 400 && !MapAppServiceIdWithReleaseLog.IsEmpty() && String.isNotEmpty(res.getBody())){
+                            while (parser.nextToken() != null) {
+                                if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                                    (parser.getText() == 'approvedToTurn')) {
+                                        parser.nextToken();
+                                        // Get the value.
+                                        approveToTurn = parser.getText();
+                                    }
+                                else if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                                         (parser.getText() == 'resultCode')) {
+                                             parser.nextToken();
+                                             // Get the value.
+                                             resultCode = parser.getText();
+                                         }
+                                
+                            }
+                            
+                            if(string.isNotEmpty(approveToTurn) && string.isNotEmpty(resultCode) && resultCode == Label.DryRunCode){
+                                glapiDryResults.ListOfScanResults.add('Pass');
+                                lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,GlapiDryRunCalloutStatus__c='Passed',ApprovedToTurn_Dry_Run__c=true,Callout_Status__c='Turn Approval (Dry Run) Passed',Turn_Approval_Dry_Run_Error_Message__c=''));
+                            }
+                            
+                            else{
+                                errorMessage =res.getBody();
+                                IsDryRunFailed = True;
+                                glapiDryResults.ListOfScanResults.add('Fail');
+                                glapiDryResults.ErrorMessage = 'Error occured during Turn Approval(Dry Run) Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                                lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,GlapiDryRunCalloutStatus__c='Failed',ApprovedToTurn_Dry_Run__c=false,Error_Message__c=glapiDryResults.ErrorMessage,Callout_Status__c='Turn Approval (Dry Run) Failed',Turn_Approval_Dry_Run_Error_Message__c=errorMessage));
+                            }
+                        }
+
+                        
+                        else {
+                            errorMessage = res.getBody();
+                            IsDryRunFailed = True;
+                             glapiDryResults.ListOfScanResults.add('Fail');
+                             glapiDryResults.ErrorMessage = 'Error occured during Turn Approval(Dry Run) Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                            lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,GlapiDryRunCalloutStatus__c='Failed',ApprovedToTurn_Dry_Run__c=false,Error_Message__c=glapiDryResults.ErrorMessage,Callout_Status__c='Turn Approval (Dry Run) Failed',Turn_Approval_Dry_Run_Error_Message__c=glapiDryResults.ErrorMessage));
+                        }
+                    }
+                    else if(String.isNotEmpty(calloutType) && calloutType =='Actual'){
+                        if(res.getStatusCode() == 200 && !MapAppServiceIdWithReleaseLog.IsEmpty()){
+                            
+                            while (parser.nextToken() != null) {
+                                if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                                    (parser.getText() == 'approvedToTurn')) {
+                                        parser.nextToken();
+                                        // Get the value.
+                                        approveToTurn = parser.getText();
+                                    }
+                                if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                                    (parser.getText() == 'executionLogId')) {
+                                        parser.nextToken();
+                                        // Get the value.
+                                        GlapiExecutionId = parser.getText();
+                                    }
+                                
+                            }
+                            system.debug('value of approveToTurn'+approveToTurn);
+                            if(string.isNotEmpty(approveToTurn) && approveToTurn =='true'){
+                                glapiActualResults.ListOfScanResults.add('Pass');
+                                lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,GlapiActualRunCalloutStatus__c='Passed',ApprovedToTurn__c=true,Callout_Status__c='Turn Approval Passed',Execution_Log_Id__c=GlapiExecutionId,Turn_Approval_Error_Message__c=''));
+                            }
+                            else{
+                                IsActualRunFailed = true;
+                                glapiActualResults.ListOfScanResults.add('Fail');
+                                lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,GlapiActualRunCalloutStatus__c='Failed',ApprovedToTurn__c=true,Callout_Status__c='Turn Approval Failed',Turn_Approval_Error_Message__c=res.getBody()));
+                                
+                            }
+                        }
+                        else{
+                            IsActualRunFailed = true;
+                             glapiActualResults.ListOfScanResults.add('Fail');
+                            glapiActualResults.ErrorMessage = 'Error occured during Turn Approval Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                            lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,GlapiActualRunCalloutStatus__c='Failed',ApprovedToTurn__c=false,Error_Message__c=glapiActualResults.ErrorMessage,Callout_Status__c='Turn Approval Failed',Turn_Approval_Error_Message__c=glapiActualResults.ErrorMessage));
+                        }
+                    }
+                }
+                
+                
+                
+                
+                
+            }catch(Exception e){
+                system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+                
+                if(String.isNotEmpty(calloutType) && calloutType =='Actual'){
+                   IsActualRunFailed = true;
+                     glapiActualResults.ListOfScanResults.add('Fail');
+                    lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,GlapiActualRunCalloutStatus__c='Failed',ApprovedToTurn__c=false,Error_Message__c=e.getMessage(),Callout_Status__c='Turn Approval Failed',Turn_Approval_Error_Message__c=e.getMessage()));
+                    
+                }
+                else if(String.isNotEmpty(calloutType) && calloutType =='Dry'){
+                    IsDryRunFailed = true;
+                     glapiDryResults.ListOfScanResults.add('Fail');
+                    lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,GlapiActualRunCalloutStatus__c='Failed',ApprovedToTurn__c=false,Error_Message__c=e.getMessage(),Callout_Status__c='Turn Approval (Dry Run) Failed',Turn_Approval_Dry_Run_Error_Message__c=e.getMessage()));
+                    
+                }
+            }
+        }
+        if(String.isNotEmpty(calloutType) && calloutType =='Actual'){
+            if(!IsActualRunFailed){
+                lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Turn Approval Completed', Quality_Checks_Status__c='In-Progress'));
+                
+            }
+            else{
+                lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Turn Approval Failed', Quality_Checks_Status__c='Failed'));
+                
+            }
+        }
+        else if(String.isNotEmpty(calloutType) && calloutType =='Dry'){
+            if(!IsDryRunFailed){
+                lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Turn Approval(Dry-Run) Completed', Quality_Checks_Status__c='In-Progress'));
+                
+            }
+            else{
+                lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Turn Approval(Dry-Run) Failed', Quality_Checks_Status__c='Failed'));
+                
+            }
+        }
+        
+        if(!lstReleaseLogsToUpdate.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isUpdateable()){
+            update lstReleaseLogsToUpdate;
+        }
+        if(!lstReleaseToUpdate.isEmpty()  && Schema.sObjectType.copado__Release__c.isUpdateable()){
+            Update lstReleaseToUpdate;
+        }
+        if(String.isNotEmpty(calloutType) && calloutType =='Actual'){
+            return glapiActualResults;
+        }
+        else
+            return glapiDryResults;
+    }
+    
+    @AuraEnabled
+    public static String runSnapshotCallout(String releaseId) {
+        String snapShotResult = '';
+        copado__Release__c releaseRecord = new copado__Release__c();
+        Set<String> usRepoName = new Set<String>();
+        List<copado__Git_Backup__c> lstBackupRepo = new List<copado__Git_Backup__c>();
+        
+        
+        HTTPResponse res = new HTTPResponse();
+
+
+        List<copado__Release__c> lstReleaseToUpdate =  new List<copado__Release__c>();
+        List<Release_Certification_Log__c> lstReleaseLogsToUpdate =  new List<Release_Certification_Log__c>();
+        String body = '';
+        String approveToTurn = '';
+        String resultCode = '';
+        string errorMessage = '';
+        String GlapiExecutionId ='';
+        
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible()){
+            releaseRecord = [SELECT id,
+                             (SELECT id,External_Id__c,copado__Project__r.copado__Deployment_Flow__r.copado__Git_Repository__r.Name,copado__Project__r.SNOW_APPSVCID__c,
+                              copado__project__r.SNOWTemplate_Id__c FROM copado__User_Stories__r),
+                             (SELECT id,Build_Id__c,SNOW_APPSVCID__c,Azure_Work_Items__c FROM Release_Certification_Logs__r where Status__c=:'Active') FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        }
+        String rclRecordID = releaseRecord.Release_Certification_Logs__r.get(0).Id;
+        
+        for(copado__User_Story__c usRec : releaseRecord.copado__User_Stories__r){
+            usRepoName.add(usRec.copado__Project__r.copado__Deployment_Flow__r.copado__Git_Repository__r.Name+' Backup');
+        }
+        system.debug('usRepoName: '+usRepoName);
+        if(usRepoName.size()>0 && Schema.sObjectType.copado__Git_Backup__c.isQueryable() && Schema.sObjectType.copado__Git_Backup__c.isAccessible() && Schema.sObjectType.copado__Git_Backup__c.fields.Id.isAccessible()){
+            lstBackupRepo = [SELECT Id FROM copado__Git_Backup__c WHERE copado__Git_Repository__r.name IN :usRepoName];
+        }
+        system.debug('lstBackupRepo: '+lstBackupRepo);
+
+        for(copado__Git_Backup__c backup : lstBackupRepo){
+            try{
+
+
+
+
+
+
+
+
+
+
+
+
+
+                res = getSnapshotCallout(String.valueOf(Method.GET),'/json/v1/webhook/gitSnapshot/'+backup.Id+'?api_key='+Label.Copado_API_Key+'&apply_env_vars=false&apply_find_replace=false'); 
+                system.debug('res status code :'+res.getStatusCode());
+                system.debug('res value :'+res.getBody());
+
+                JSONParser parser = JSON.createParser(res.getBody());
+                String copadoJobId='';
+                if(res != null && res.getStatusCode() == 200 && String.isNotEmpty(res.getBody())){
+                    while (parser.nextToken() != null) {
+                        if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                            (parser.getText() == 'copadoJobId')) {
+                                parser.nextToken();
+                                // Get the value.
+                                copadoJobId = parser.getText();
+                            }
+                    }
+
+                    snapShotResult = 'Pass';
+                    lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=rclRecordID,Pre_Deployment_Backup_Callout_Status__c='Passed',Pre_Deployment_Backup_Error_Message__c='',Backup_Job_Id__c=copadoJobId));
+                }
+                else {
+                    errorMessage = res.getBody();
+                    lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=rclRecordID,Pre_Deployment_Backup_Callout_Status__c='Failed',Pre_Deployment_Backup_Error_Message__c=errorMessage));
+                }
+            }
+            catch(Exception e){
+                system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+
+                lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=rclRecordID,Pre_Deployment_Backup_Callout_Status__c='Failed',Pre_Deployment_Backup_Error_Message__c=e.getMessage()));
+            }
+        }
+        if(snapShotResult=='Pass'){
+            lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Pre Deployment Backup Completed', Quality_Checks_Status__c='Completed'));
+        }
+        else{
+            lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Pre Deployment Backup Failed', Quality_Checks_Status__c='Failed'));
+        }
+        
+        if(!lstReleaseLogsToUpdate.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isUpdateable()){
+            update lstReleaseLogsToUpdate;
+        }
+        if(!lstReleaseToUpdate.isEmpty()  && Schema.sObjectType.copado__Release__c.isUpdateable()){
+            Update lstReleaseToUpdate;
+        }
+        
+        return snapShotResult;
+    }
+    
+    @AuraEnabled
+    public static String retrieveSnapshotStatus(String releaseId) {
+        copado__Release__c releaseRecord = new copado__Release__c();
+        HTTPResponse res = new HTTPResponse();
+        List<Release_Certification_Log__c> lstReleaseLogsToUpdate =  new List<Release_Certification_Log__c>();
+        string errorMessage = '';
+        
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible()){
+            releaseRecord = [SELECT id,
+                             (SELECT id,Build_Id__c,SNOW_APPSVCID__c,Azure_Work_Items__c,Backup_Job_Id__c,Backup_Status__c FROM Release_Certification_Logs__r where Status__c=:'Active') FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        }
+        
+        String rclRecordID = releaseRecord.Release_Certification_Logs__r.get(0).Id;
+        String backupJobId = releaseRecord.Release_Certification_Logs__r.get(0).Backup_Job_Id__c;
+        String snapShotstatus = '';
+        boolean isFinished = false;
+        boolean isSuccess = false;
+        
+        try{
+
+            res = getSnapshotCallout(String.valueOf(Method.GET),'/json/v1/webhook/jobStatus/'+backupJobId+'?api_key='+Label.Copado_API_Key); 
+            system.debug('res status code :'+res.getStatusCode());
+            system.debug('res value :'+res.getBody());
+            JSONParser parser = JSON.createParser(res.getBody());
+            if(res != null && res.getStatusCode() == 200 && String.isNotEmpty(res.getBody())){
+                while (parser.nextToken() != null) {
+                    if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                        (parser.getText() == 'status')) {
+                            parser.nextToken();
+                            // Get the value.
+                            snapShotstatus = parser.getText();
+                        }
+                    if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                        (parser.getText() == 'isFinished')) {
+                            parser.nextToken();
+                            // Get the value.
+                            isFinished = parser.getBooleanValue();
+                        }
+                    if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                        (parser.getText() == 'isSuccess')) {
+                            parser.nextToken();
+                            // Get the value.
+                            isSuccess = parser.getBooleanValue();
+                        }
+                }
+                if(snapShotstatus=='done' && isSuccess && isFinished){
+                    snapShotstatus = 'Completed';
+                }else if(!isFinished){
+                    snapShotstatus = 'In-Progress';
+                }else{
+                    snapShotstatus = 'Failed';
+                }
+                lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=rclRecordID,Backup_Status__c=snapShotstatus));
+            }
+            else {
+                errorMessage = res.getBody();
+                lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=rclRecordID,Backup_Status__c='Failed',Pre_Deployment_Backup_Error_Message__c=errorMessage));
+            }
+        }
+        catch(Exception e){
+            system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+            lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=rclRecordID,Backup_Status__c='Failed',Pre_Deployment_Backup_Error_Message__c=e.getMessage()));
+        }
+        
+        if(!lstReleaseLogsToUpdate.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isUpdateable()){
+            update lstReleaseLogsToUpdate;
+        }
+        
+        return snapShotstatus;
+    }
+    
+    @AuraEnabled
+    public static String runGlapiEARCallout(String releaseId) {
+        Boolean isSnowFailed = false;
+        String snowResults ='';
+        String snowSysId = '';
+        String serviceNowResult = '';
+        List<Release_Certification_Log__c> lstReleaseLogsToUpdate = new List<Release_Certification_Log__c>();
+        List<copado__Release__c> lstReleaseToUpdate =  new List<copado__Release__c>();
+        copado__Release__c releaseRecord = new copado__Release__c();
+        
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible()){
+            releaseRecord = [SELECT id,SecurityGrade__c,Incident_Number__c,Planned_Start_Date__c,Name,
+                             (SELECT id,Build_Id__c,SNOW_APPSVCID__c FROM Release_Certification_Logs__r where Status__c=:'Active'),
+                             (SELECT id,copado__Project__r.SNOW_APPSVCID__c,External_Id__c,copado__Project__r.SNOWTemplate_Id__c FROM copado__User_Stories__r) 
+                             FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        }
+        String appServId='';//APPSVC028476';
+        String relLogID='';
+        if(releaseRecord!=null && !releaseRecord.copado__User_Stories__r.isEmpty()){
+            appServId = releaseRecord.copado__User_Stories__r.get(0).copado__Project__r.SNOW_APPSVCID__c;
+        }
+        
+        try{
+            relLogID =  releaseRecord.Release_Certification_Logs__r.get(0).Id;
+            string shortDescription = 'Automated Copado Emergency Release => Release : '+releaseRecord.Name+'\\n';
+            string description = 'Automated Copado Emergency Release => Release : '+releaseRecord.Name+'\\n';
+            description+= '\\n Copado Release Link : '+URL.getOrgDomainURL().toExternalForm() + '/' +releaseRecord.Id;
+            String body = '{"change_template": "VCOPADO-'+appServId+'","Requester":"Copado", "Application":"'+appServId+'","change_type": "ear",'+
+                          '"planned_start_date_time":"'+releaseRecord.Planned_Start_Date__c+'","planned_end_date_time":"'+releaseRecord.Planned_Start_Date__c.addDays(+7)+'",'+
+                          '"short_description":"'+shortDescription+'","App_Release_type": "Other","description": "'+description +'",'+
+                          '"Release_type": "Non integrated Release","Release":"'+releaseRecord.Planned_Start_Date__c.format('YY.MM')+'","Incident": "'+releaseRecord.Incident_Number__c+'"}';
+            system.debug('value of Change Order Callout body:'+body);
+            
+            HTTPResponse res = getEARGlapiCalloutResponse('POST',body,null); 
+            system.debug('res status code :'+res.getStatusCode());
+            system.debug('res value :'+res.getBody());
+            if(res.getStatusCode() == 200 && res.getBody()!=null){
+                Map<String, object> parsedRes = (Map<String, object>)JSON.Deserializeuntyped(res.getBody());//'{"result": {"change_number": "CHG0244904"}}'
+                Map<String, object> resultRes = (Map<String, object>)parsedRes.get('result');
+                String changeRequestNumber = (String)resultRes.get('change_number');
+                
+                system.debug('value of changeRequestNumber'+changeRequestNumber);
+                if(string.isNotEmpty(changeRequestNumber)){
+                    snowResults ='Pass';
+                    lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,Status__c='Active',SNOW_Callout_Status__c='Passed',Callout_Status__c='Change Order Passed',Change_Request_Number__c=changeRequestNumber,SNOW_Sys_Id__c=SnowSysId,Change_Order_Error_Message__c=''));
+                }
+                else{
+                    serviceNowResult = 'Error occured during Change Order Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                    isSnowFailed = True;
+                    snowResults ='Fail';
+                    lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,Status__c='Active',SNOW_Callout_Status__c='Failed',Callout_Status__c='Change Order Failed',Change_Order_Error_Message__c=serviceNowResult));
+                }
+            }
+            else{
+                isSnowFailed = True;
+                serviceNowResult = 'Error occured during Change Order Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                snowResults ='Fail';
+                lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,Status__c='Active',SNOW_Callout_Status__c='Failed',Error_Message__c='Failed ! Error occured during Change Order callout : '+res.getBody(),Callout_Status__c='Change Order Failed',Change_Order_Error_Message__c=serviceNowResult));
+            }
+            
+            if(!isSnowFailed){
+                lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Change Order Completed', Quality_Checks_Status__c='Completed'));
+            }
+            else{
+                lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Change Order Failed', Quality_Checks_Status__c='Failed'));
+            }
+            
+            if(!lstReleaseToUpdate.isEmpty()  && Schema.sObjectType.copado__Release__c.isUpdateable()){
+                Update lstReleaseToUpdate;
+            }
+        }catch(Exception e){
+            system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+            snowResults ='Pass';
+            lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=relLogID,Release__c=ReleaseId,Status__c='Active',SNOW_Callout_Status__c='Failed',Error_Message__c=e.getMessage(),Change_Order_Error_Message__c=e.getMessage()));
+        }
+        
+        if(!lstReleaseLogsToUpdate.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isUpdateable()){
+            update lstReleaseLogsToUpdate;
+        }
+        
+        return snowResults;
+    }
+    
+    public static HttpResponse getGlapiCalloutResponse(String requestType, String requestBody,String endpointUrl){
+        
+        HTTPResponse res = new HTTPResponse();
+        HttpRequest req = new HttpRequest();
+        if(string.isNotBlank(requestType)){
+             Integer startTime = System.Now().millisecond();
+            try{
+                req.setMethod(requestType);
+                if(string.isNotEmpty(endpointUrl) && string.isNotEmpty(requestType) && requestType == 'PUT'){
+                    req.setHeader('Content-Length', '0');
+                    req.setEndpoint('callout:GlapiCallout/'+endpointUrl);
+                }
+                else if(string.isNotEmpty(requestBody) && string.isNotEmpty(requestType) && requestType == 'POST'){
+                    req.setBody(requestBody);
+                    req.setEndpoint('callout:GlapiCallout');
+                    
+        }
+    req.setHeader('x-functions-key', '{!$Credential.Password}'); //0jpjtGv6qFFkpBiGePbA8QAtvAGuxReQ
+                req.setHeader('Content-Type','application/json');
+                req.setTimeout(120000);
+                system.debug('Request body '+requestBody);
+                Http http = new Http();
+                res = http.send(req);   
+                Integer endTime = System.Now().millisecond();
+                Integer diff = endTime - startTime;
+                system.debug('glapi api start time ' + startTime + ' endTime '+ endTime + ' diff ' + diff);
+                system.debug(res.getStatusCode()+ ' value of res '+res.getBody());
+            }catch(Exception e){
+                Integer endError = System.Now().millisecond();
+                Integer diff = endError - startTime;
+                system.debug('glapi api start time ' + startTime + ' endTime '+ endError + ' diff ' + diff);
+                system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+            }
+        }
+        return res;
+    }
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    public static HttpResponse getSnapshotCallout(String requestType, String endpointUrl){
+        
+        HTTPResponse res = new HTTPResponse();
+        HttpRequest req = new HttpRequest();
+        if(string.isNotBlank(requestType)){
+             Integer startTime = System.Now().millisecond();
+            try{
+                req.setMethod(requestType);
+                req.setEndpoint('callout:GIT_SnapShot'+endpointUrl);
+                req.setHeader('x-functions-key', '{!$Credential.Password}'); 
+                req.setHeader('Content-Type','application/json');
+                req.setTimeout(120000);
+                Http http = new Http();
+                res = http.send(req);   
+                Integer endTime = System.Now().millisecond();
+                Integer diff = endTime - startTime;
+                system.debug('Snapshot api start time ' + startTime + ' endTime '+ endTime + ' diff ' + diff);
+                system.debug(res.getStatusCode()+ ' value of res '+res.getBody());
+            }catch(Exception e){
+                Integer endError = System.Now().millisecond();
+                Integer diff = endError - startTime;
+                system.debug('Snapshot api start time ' + startTime + ' endTime '+ endError + ' diff ' + diff);
+                system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+            }
+        }
+        return res;
+    }
+    
+    public static HttpResponse getEARGlapiCalloutResponse(String requestType, String requestBody,String endpointUrl){
+        
+        HTTPResponse res = new HTTPResponse();
+        HttpRequest req = new HttpRequest();
+        if(string.isNotBlank(requestType)){
+            Integer startTime = System.Now().millisecond();
+            try{
+                req.setMethod(requestType);
+                if(string.isNotEmpty(requestBody) && string.isNotEmpty(requestType) && requestType == 'POST'){
+                    req.setBody(requestBody);
+                    req.setEndpoint('callout:EARCallout');
+                    
+                }
+                req.setHeader('x-functions-key', '{!$Credential.Password}'); //0jpjtGv6qFFkpBiGePbA8QAtvAGuxReQ
+                req.setHeader('Content-Type','application/json');
+                req.setTimeout(120000);
+                system.debug('Request body '+requestBody);
+                Http http = new Http();
+                res = http.send(req);   
+                Integer endTime = System.Now().millisecond();
+                Integer diff = endTime - startTime;
+                system.debug('glapi api start time ' + startTime + ' endTime '+ endTime + ' diff ' + diff);
+                system.debug(res.getStatusCode()+ ' value of res '+res.getBody());
+            }catch(Exception e){
+                Integer endError = System.Now().millisecond();
+                Integer diff = endError - startTime;
+                system.debug('glapi api start time ' + startTime + ' endTime '+ endError + ' diff ' + diff);
+                system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+            }
+        }
+        return res;
+    }
+    
+    @AuraEnabled
+    public static String runServiceNowCallout(String releaseId, string calloutType) {
+        Boolean isSnowFailed = false;
+        String SnowResults ='';
+        String SnowSysId = '';
+        String serviceNowResult = '';
+        HTTPResponse res = new HTTPResponse();
+        List<copado__User_Story__c> toUpdateUserStories = new List<copado__User_Story__c>();
+        copado__Release__c releaseRecord = new copado__Release__c();
+        List<copado__Release__c> lstReleaseToUpdate =  new List<copado__Release__c>();
+        List<Release_Certification_Log__c> lstReleaseLogsToUpdate =  new List<Release_Certification_Log__c>();
+        Map<String,Release_Certification_Log__c> MapAppServiceIdWithReleaseLog = new Map<String,Release_Certification_Log__c>();
+        string AzureItemListForSNOWStartString = 'Azure Work items: ';
+        copado__Release__c releaseWithUserStories = new copado__Release__c();
+        Map<string, string> AppSVcIdToAzureWorkItemMap= new Map<string, string>();
+        releaseWithUserStories = [SELECT name,(SELECT id,External_Id__c,copado__Story_Points_SFDC__c, Name, copado__Project__r.SNOW_APPSVCID__c FROM copado__User_Stories__r) FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        for(copado__User_Story__c us : releaseWithUserStories.copado__User_Stories__r){
+            string AzureItemListForSNOW = '';
+            if(AppSVcIdToAzureWorkItemMap.containsKey(us.copado__Project__r.SNOW_APPSVCID__c)){
+                AzureItemListForSNOW = AppSVcIdToAzureWorkItemMap.get(us.copado__Project__r.SNOW_APPSVCID__c);
+                AzureItemListForSNOW = AzureItemListForSNOW + AzureItemListForSNOWStartString + us.External_Id__c+'(Copado : '+us.Name+ ', Story Points: '+us.copado__Story_Points_SFDC__c+')\\n';
+            }else{
+                AzureItemListForSNOW = AzureItemListForSNOWStartString + us.External_Id__c+'(Copado : '+us.Name+ ', Story Points: '+us.copado__Story_Points_SFDC__c+')\\n';
+            }
+             AppSVcIdToAzureWorkItemMap.put(us.copado__Project__r.SNOW_APPSVCID__c,AzureItemListForSNOW );
+            system.debug(AppSVcIdToAzureWorkItemMap);
+        }
+        
+        List<SEC_API_Scan_Result__c> releaseSecApiScanResults = new List<SEC_API_Scan_Result__c>();            
+        releaseSecApiScanResults = [select Release_Copado__c,Scan_Status__c,Score_Card__c, SecApi_Scan_Status__c,Critical__c,Critical_SCA__c, High__c,High_SCA__c, Medium__c,Medium_SCA__c, Low__c,Low_SCA__c,Release_Copado__r.SecurityGrade__c  from SEC_API_Scan_Result__c where Release_Copado__c=:releaseId WITH SECURITY_ENFORCED order by CreatedDate Desc limit 1];
+        for(String appSvc: AppSVcIdToAzureWorkItemMap.keySet()){            
+            for(SEC_API_Scan_Result__c sec : releaseSecApiScanResults){                
+                string secAPIDetail = '\\n SECURITY SCAN RESULTS : \\n';
+                secAPIDetail = AppSVcIdToAzureWorkItemMap.get(appSvc) + secAPIDetail;
+                secAPIDetail = secAPIDetail + '\\n Release Grade : ' + sec.Release_Copado__r.SecurityGrade__c + '\\n';
+                secAPIDetail = secAPIDetail +'\\n SAST Scan Results  =  ' + '  Critical: ' + sec.Critical__c+ ' ,  High: ' + sec.High__c+ ' ,  Medium: '+ sec.Medium__c+ ' ,  Low: '+ sec.Low__c +'\\n';
+                //secAPIDetail = secAPIDetail + 'Critical: ' + sec.Critical__c+ ' , High: ' + sec.High__c+ ' , Medium: '+ sec.Medium__c+ ' , Low: '+ sec.Low__c +'\\n';
+                secAPIDetail = secAPIDetail +'\\n SCA Scan Results  =  '+'  Critical: ' + sec.Critical_SCA__c+  ' ,  High: ' + sec.High_SCA__c+ ' ,  Medium: '+ sec.Medium_SCA__c+ ' ,  Low: '+ sec.Low_SCA__c +'\\n';
+               // secAPIDetail = secAPIDetail + 'Critical: ' + sec.Critical_SCA__c+  ' , High: ' + sec.High_SCA__c+ ' , Medium: '+ sec.Medium_SCA__c+ ' , Low: '+ sec.Low_SCA__c +'\\n';
+                //secAPIDetail = secAPIDetail +'\\n Copado Release Link: '+URL.getOrgDomainURL().toExternalForm() + '/' +releaseId;                
+                //secAPIDetail = secAPIDetail +'\\n Copado Release Name:  [code]<a href='+URL.getOrgDomainURL().toExternalForm()+'/'+releaseId+'>'+releaseWithUserStories.name+'</a>[/code]';
+                //secAPIDetail = secAPIDetail +'\\n Copado Release Link:  [code]<a href='+URL.getOrgDomainURL().toExternalForm()+'/'+releaseId+'>'+URL.getOrgDomainURL().toExternalForm()+'/'+releaseId+'</a>[/code]';
+                AppSVcIdToAzureWorkItemMap.put(appSvc,secAPIDetail );
+            }
+        }
+        String body = '';
+        String changeRequestNumber = '';
+        String endPointUrl = '/import/x_mioms_azpipeline_change_request_import'; 
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible()){
+            releaseRecord = [SELECT id, Name, (SELECT id,BuildId__c,SNOW_APPSVCID__c,Azure_Work_Items__c,SNOWTemplate_Id__c FROM Release_Certification_Logs__r where Status__c=:'Active') FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        }
+        for(Release_Certification_Log__c rch : releaseRecord.Release_Certification_Logs__r){
+            MapAppServiceIdWithReleaseLog.put(rch.SNOW_APPSVCID__c,rch);
+        }       
+        
+        string shortdescription = 'Automated Copado Certified Release => Release :'+releaseRecord.Name+'\\n';
+        string description = 'Automated Copado Certified Release => Release :'+releaseRecord.Name+'\\n';        
+        description+= 'Copado Release Link: '+URL.getOrgDomainURL().toExternalForm() + '/' +releaseRecord.Id;
+        try{
+            for(String str : MapAppServiceIdWithReleaseLog.keySet()){
+                body = '{"u_correlation_id":"'+ MapAppServiceIdWithReleaseLog.get(str).BuildId__c +'","u_type":"Normal","u_x_mioms_azpi_eline_metadata":"","u_short_description":"'+shortdescription+'","u_description":"'+description+'","u_requested_by_date":"'+string.valueOfGmt( Datetime.now())+' UTC","u_start_date":"","u_end_date":"","u_certified_change_template":"'+MapAppServiceIdWithReleaseLog.get(str).SNOWTemplate_Id__c+'","u_cmdb_ci":"","u_app_service_id":"'+str+'","u_correlation_display":"AzurePipelines", "u_work_notes":"'+AppSVcIdToAzureWorkItemMap.get(str)+'"}';
+                 System.debug('@@snowbody ' + body);
+                if(String.isNotBlank(str) && String.isNotBlank(body) ){
+                    res = getSNOWCalloutResponse('POST',body,endPointUrl); 
+                    system.debug('res status code :'+res.getStatusCode());
+                    system.debug('res value :'+res.getBody());
+                    JSONParser parser = JSON.createParser(res.getBody());
+                    
+                    if(res.getStatusCode() == 201 && !MapAppServiceIdWithReleaseLog.IsEmpty()){
+                        while (parser.nextToken() != null) {
+                            if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                                (parser.getText() == 'display_value')) {
+                                    parser.nextToken();
+                                    // Get the value.
+                                    changeRequestNumber = parser.getText();
+                                }
+                            if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                                (parser.getText() == 'sys_id')) {
+                                    parser.nextToken();
+                                    // Get the value.
+                                    SnowSysId = parser.getText();
+                                }
+                            
+                        }
+                        if(String.isNotEmpty(changeRequestNumber)){
+                            SnowResults ='Pass';
+                            lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,SNOW_Callout_Status__c='Passed',Callout_Status__c='Change Order Passed',Change_Request_Number__c=changeRequestNumber,SNOW_Sys_Id__c=SnowSysId));
+                        }
+                        else{
+                            serviceNowResult = 'Error occured during Change Order Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                            isSnowFailed = True;
+                            SnowResults ='Fail';
+                            lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,SNOW_Callout_Status__c='Failed',Callout_Status__c='Change Order Failed',Change_Order_Error_Message__c=serviceNowResult));
+                        }
+                    }
+                    else{
+                        isSnowFailed = True;
+                        serviceNowResult = 'Error occured during Change Order Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                        SnowResults ='Fail';
+                        lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,SNOW_Callout_Status__c='Failed',Error_Message__c='Failed ! Error occured during Change Order callout : '+res.getBody(),Callout_Status__c='Change Order Failed',Change_Order_Error_Message__c=serviceNowResult));
+                    }
+                    
+                }
+            }
+            if(!isSnowFailed){
+                lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Change Order Completed', Quality_Checks_Status__c='In-Progress'));
+                
+            }
+            else{
+                lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Change Order Failed', Quality_Checks_Status__c='Failed'));
+                
+            }
+            
+            
+            if(!lstReleaseLogsToUpdate.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isUpdateable()){
+                update lstReleaseLogsToUpdate;
+            }
+            if(!lstReleaseToUpdate.isEmpty() && Schema.sObjectType.copado__Release__c.isUpdateable()){
+                Update lstReleaseToUpdate;
+            }
+            
+        }catch(Exception e){
+            system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+        }
+        return SnowResults;
+    }
+    
+    @AuraEnabled
+    public static String checkServiceNowStatus(String releaseId) {
+        String SnowResults ='';
+        String SnowStatus ='';
+        String endPointUrl = '/table/change_request?sysparm_query=number%3D';
+        String serviceNowResult = '';
+        Map<String,String> MapStatewithStatusCode = new Map<String,String>{'-5'=>'New','-4'=>'Assess','-3'=>'Authorize','-2'=>'Scheduled','-1'=>'Implement','0'=>'Review','3'=>'Closed','4'=>'Canceled'};
+        copado__Release__c releaseRecord = new copado__Release__c();
+        HTTPResponse res = new HTTPResponse();
+        List<copado__Release__c> lstReleaseToUpdate =  new List<copado__Release__c>();
+        List<Release_Certification_Log__c> lstReleaseLogsToUpdate =  new List<Release_Certification_Log__c>();
+        Map<String,Release_Certification_Log__c> MapAppServiceIdWithReleaseLog = new Map<String,Release_Certification_Log__c>();
+        String body = '';
+        String changeRequestNumber = '';
+        String stateCode = '';
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible()){
+            releaseRecord = [SELECT Id,(SELECT id,BuildId__c,SNOW_APPSVCID__c,Azure_Work_Items__c,Change_Request_Number__c,SNOWTemplate_Id__c,SNOW_Sys_Id__c FROM Release_Certification_Logs__r where Status__c=:'Active') FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        }
+        for(Release_Certification_Log__c rch : releaseRecord.Release_Certification_Logs__r){
+            if(rch != null && string.isNotEmpty(rch.SNOW_APPSVCID__c))
+                MapAppServiceIdWithReleaseLog.put(rch.SNOW_APPSVCID__c,rch);
+        }
+        try{
+            for(String str : MapAppServiceIdWithReleaseLog.keySet()){
+                if(String.isNotEmpty(str)){
+                    if(!MapAppServiceIdWithReleaseLog.isEmpty() && String.isNotEmpty(str))
+                        system.debug('changerequestnumber : '+MapAppServiceIdWithReleaseLog.get(str).Change_Request_Number__c);
+                    endPointUrl = endPointUrl+MapAppServiceIdWithReleaseLog.get(str).Change_Request_Number__c+'&sysparm_display_value=false&sysparm_exclude_reference_link=true&sysparm_fields=number%2Cstate%2Csys_id%2Csys_created_by';
+                    system.debug('endPointUrl : '+endPointUrl);
+                    res = getSNOWCalloutResponse('GET',null,endPointUrl); 
+                    system.debug('res status code :'+res.getStatusCode());
+                    system.debug('res value :'+res.getBody());
+                    JSONParser parser = JSON.createParser(res.getBody());
+                    
+                    if(res.getStatusCode() == 200 && !MapAppServiceIdWithReleaseLog.isEmpty()){
+                        while (parser.nextToken() != null) {
+                            if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                                (parser.getText() == 'state')) {
+                                    parser.nextToken();
+                                    // Get the value.
+                                    stateCode = parser.getText();
+                                }
+                        }
+                        if(!MapStatewithStatusCode.isEmpty() && MapStatewithStatusCode.get(stateCode) != null)  
+                            snowStatus = MapStatewithStatusCode.get(stateCode);
+                        lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,Change_Order_Status__c=snowStatus,Change_Order_State__c=stateCode));
+                        
+                    }
+                    else{
+                        snowStatus = 'Error occured during checking status of Change Order';
+                        serviceNowResult = 'Error occured during Change Order Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                        lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,Callout_Status__c='Change Order Failed',Change_Order_Error_Message__c=serviceNowResult));
+                    }
+                    
+                }
+            }
+            
+            if(!lstReleaseLogsToUpdate.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isUpdateable()){
+                update lstReleaseLogsToUpdate;
+            }
+        }catch(Exception e){
+            system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+        }
+        return SnowStatus;
+    }
+    
+    @AuraEnabled
+    public static String checkEARServiceNowStatus(String releaseId) {
+        String snowStatus ='';
+        String endPointUrl = '/table/change_request?sysparm_query=number%3D';
+        Map<String,String> MapStatewithStatusCode = new Map<String,String>{'-5'=>'New','-4'=>'Assess','-3'=>'Authorize','-2'=>'Scheduled','-1'=>'Implement','0'=>'Review','3'=>'Closed','4'=>'Canceled'};
+        copado__Release__c releaseRecord = new copado__Release__c();
+        HTTPResponse res = new HTTPResponse();
+        List<Release_Certification_Log__c> lstReleaseLogsToUpdate =  new List<Release_Certification_Log__c>();
+        Map<String,Release_Certification_Log__c> MapAppServiceIdWithReleaseLog = new Map<String,Release_Certification_Log__c>();
+        String stateCode = '';
+        String snowSysId = '';
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible()){
+            releaseRecord = [SELECT Id,(SELECT id,BuildId__c,SNOW_APPSVCID__c,Azure_Work_Items__c,Change_Request_Number__c,SNOWTemplate_Id__c,SNOW_Sys_Id__c FROM Release_Certification_Logs__r where Status__c=:'Active') FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        }
+        for(Release_Certification_Log__c rch : releaseRecord.Release_Certification_Logs__r){
+            if(rch != null && string.isNotEmpty(rch.SNOW_APPSVCID__c))
+                MapAppServiceIdWithReleaseLog.put(rch.SNOW_APPSVCID__c,rch);
+        }
+        try{
+            for(String str : MapAppServiceIdWithReleaseLog.keySet()){
+                if(String.isNotEmpty(str)){
+                    if(!MapAppServiceIdWithReleaseLog.isEmpty() && String.isNotEmpty(str))
+                        system.debug('changerequestnumber : '+MapAppServiceIdWithReleaseLog.get(str).Change_Request_Number__c);
+                    endPointUrl = endPointUrl+MapAppServiceIdWithReleaseLog.get(str).Change_Request_Number__c+'&sysparm_display_value=false&sysparm_exclude_reference_link=true&sysparm_fields=number%2Cstate%2Csys_id%2Csys_created_by';
+                    system.debug('endPointUrl : '+endPointUrl);
+                    res = getSNOWCalloutResponse('GET',null,endPointUrl); 
+                    system.debug('res status code :'+res.getStatusCode());
+                    system.debug('res value :'+res.getBody());
+                    JSONParser parser = JSON.createParser(res.getBody());
+                    
+                    if(res.getStatusCode() == 200 && !MapAppServiceIdWithReleaseLog.isEmpty()){
+                        while (parser.nextToken() != null) {
+                            if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                                (parser.getText() == 'state')) {
+                                    parser.nextToken();
+                                    // Get the value.
+                                    stateCode = parser.getText();
+                                }
+                            if ((parser.getCurrentToken() == JSONToken.FIELD_NAME) && 
+                                (parser.getText() == 'sys_id')) {
+                                    parser.nextToken();
+                                    // Get the value.
+                                    snowSysId = parser.getText();
+                                }
+                        }
+                        if(!MapStatewithStatusCode.isEmpty() && MapStatewithStatusCode.get(stateCode) != null)
+                            snowStatus = MapStatewithStatusCode.get(stateCode);
+                        lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,Change_Order_Status__c=snowStatus,Change_Order_State__c=stateCode,SNOW_Sys_Id__c=snowSysId));
+                        
+                    }
+                    else{
+                        snowStatus = 'Error occured during checking status of Change Order';
+                        String serviceNowResult = 'Error occured during Change Order Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                        lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,Callout_Status__c='Change Order Failed',Change_Order_Error_Message__c=serviceNowResult));
+                    }
+                    
+                }
+            }
+            
+            if(!lstReleaseLogsToUpdate.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isUpdateable()){
+                update lstReleaseLogsToUpdate;
+            }
+        }catch(Exception e){
+            system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+        }
+        return snowStatus;
+    }
+    
+    @AuraEnabled
+    public static String postEARNotesToServiceNow(String releaseId) {
+        String SnowResults ='';
+        String snowStatus ='';
+        String endPointUrl = '/table/change_request/';
+        String serviceNowResult = '';
+        copado__Release__c releaseRecord = new copado__Release__c();
+        HTTPResponse res = new HTTPResponse();
+        List<copado__Release__c> lstReleaseToUpdate =  new List<copado__Release__c>();
+        List<Release_Certification_Log__c> lstReleaseLogsToUpdate =  new List<Release_Certification_Log__c>();
+        Map<String,Release_Certification_Log__c> MapAppServiceIdWithReleaseLog = new Map<String,Release_Certification_Log__c>();
+         //string AzureItemListForSNOWStartString = 'Azure Work items: ';
+        copado__Release__c releaseWithUserStories = new copado__Release__c();
+        Map<string, string> AppSVcIdToAzureWorkItemMap= new Map<string, string>();
+        releaseWithUserStories = [SELECT Name,(SELECT id,Low__c, Medium__c, High__c,Release_Copado__r.SecurityGrade__c,Release_Copado__r.Id,Release_Copado__r.SNOW_APPSVCID__c from SecAPI_Scan_Results__r order by createddate desc limit 1),(SELECT id,External_Id__c,copado__Story_Points_SFDC__c, Name, copado__Project__r.SNOW_APPSVCID__c FROM copado__User_Stories__r) FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        for(copado__User_Story__c us : releaseWithUserStories.copado__User_Stories__r){
+            string AzureItemListForSNOW = 'Azure Work items: \\n';
+            if(AppSVcIdToAzureWorkItemMap.containsKey(us.copado__Project__r.SNOW_APPSVCID__c)){
+                AzureItemListForSNOW = AppSVcIdToAzureWorkItemMap.get(us.copado__Project__r.SNOW_APPSVCID__c);
+                AzureItemListForSNOW = AzureItemListForSNOW  + us.External_Id__c+'(Copado : '+us.Name+ ', Story Points: '+us.copado__Story_Points_SFDC__c+')\\n';
+            }else{
+                AzureItemListForSNOW = AzureItemListForSNOW +us.External_Id__c+'(Copado : '+us.Name+ ', Story Points: '+us.copado__Story_Points_SFDC__c+')\\n';
+            }
+             AppSVcIdToAzureWorkItemMap.put(us.copado__Project__r.SNOW_APPSVCID__c,AzureItemListForSNOW );
+        }
+        for(String appSvc: AppSVcIdToAzureWorkItemMap.keySet()){
+            for(SEC_API_Scan_Result__c sec : releaseWithUserStories.SecAPI_Scan_Results__r){
+                string secAPIDetail = '\\n Security scan results: \\n';
+                secAPIDetail = AppSVcIdToAzureWorkItemMap.get(appSvc) + secAPIDetail;
+                secAPIDetail = secAPIDetail +'Security Grade: ' + sec.Release_Copado__r.SecurityGrade__c+'\\n';
+                secAPIDetail = secAPIDetail + 'High: ' +sec.High__c+ ' , Medium: '+sec.Medium__c+ ' , Low: '+ sec.Low__c +'\\n';
+                //secAPIDetail = secAPIDetail +'\\n Copado Release Name:  [code]<a href='+URL.getOrgDomainURL().toExternalForm()+'/'+releaseId+'>'+releaseWithUserStories.name+'</a>[/code]';
+                //secAPIDetail = secAPIDetail +'\\n Copado Release Link:  [code]<a href='+URL.getOrgDomainURL().toExternalForm()+'/'+releaseId+'>'+URL.getOrgDomainURL().toExternalForm()+'/'+releaseId+'</a>[/code]';
+
+                AppSVcIdToAzureWorkItemMap.put(appSvc,secAPIDetail );
+            }
+        }
+       
+        String body = '';
+        String changeRequestNumber = '';
+        String stateCode = '';
+        String snowSysId = '';
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.fields.SNOW_Sys_Id__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible()){
+            releaseRecord = [SELECT Id,(SELECT id,SNOW_APPSVCID__c,SNOW_Sys_Id__c FROM Release_Certification_Logs__r where Status__c=:'Active') FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        }
+        for(Release_Certification_Log__c rch : releaseRecord.Release_Certification_Logs__r){
+            if(rch != null && string.isNotEmpty(rch.SNOW_APPSVCID__c))
+                MapAppServiceIdWithReleaseLog.put(rch.SNOW_APPSVCID__c,rch);
+        }
+        try{
+            for(String str : MapAppServiceIdWithReleaseLog.keySet()){
+                  body = '{"work_notes":"'+AppSVcIdToAzureWorkItemMap.get(str)+'"}';
+                    endPointUrl = endPointUrl+MapAppServiceIdWithReleaseLog.get(str).SNOW_Sys_Id__c;
+                    system.debug('endPointUrl : '+endPointUrl);
+                    res = getSNOWCalloutResponse('PUT',body,endPointUrl); 
+                    system.debug('res status code :'+res.getStatusCode());
+                    system.debug('res value :'+res.getBody());
+                    JSONParser parser = JSON.createParser(res.getBody());
+                    
+                    if(res.getStatusCode() == 200 && !MapAppServiceIdWithReleaseLog.isEmpty()){
+                        snowStatus='Pass';
+                        lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,Callout_Status__c='Azure Notes Passed'));
+                    }
+                    else{
+                        snowStatus = 'Error occured during posting Azure Notes';
+                        serviceNowResult = 'Error occured during posting Azure Notes Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                        lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,Callout_Status__c='Azure Notes Failed',Change_Order_Error_Message__c=serviceNowResult));
+                    }
+                    
+                
+            }
+            
+            if(!lstReleaseLogsToUpdate.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isUpdateable()){
+                update lstReleaseLogsToUpdate;
+            }
+        }catch(Exception e){
+            system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+        }
+        return snowStatus;
+    }
+    
+    public static HttpResponse getSNOWCalloutResponse(String requestType, String requestBody, String endPoint){
+        HTTPResponse res = new HTTPResponse();
+        HttpRequest req = new HttpRequest();
+        if(string.isNotBlank(requestType)){
+            try{
+                if(String.isNotBlank(requestType) && requestType == 'POST' && string.isNotEmpty(requestBody)){
+                    req.setBody(requestBody);
+                    req.setMethod('POST');
+                    
+                }
+                else if(String.isNotBlank(requestType) && requestType == 'GET'){
+                    req.setMethod('GET');
+                    
+                }
+                else if(String.isNotBlank(requestType) && requestType == 'PUT' && string.isNotEmpty(requestBody)){
+                    req.setMethod('PUT');
+                    req.setBody(requestBody);
+                }
+                req.setEndpoint('callout:SNOWCallout'+endPoint);
+                req.setHeader('Content-Type','application/json');
+
+                system.debug(' value of req Body '+requestBody);
+                Http http = new Http();
+                res = http.send(req);   
+                system.debug(res.getStatusCode()+ ' value of res '+res.getBody());
+                
+            }catch(Exception e){
+                system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+            }
+        }
+        return res;
+    }
+    
+    @AuraEnabled
+    public static String getFinalizedApprovedTurn(String releaseId) {
+        String finalResults ='';
+        Boolean isFinalizedFailed = false;
+        HTTPResponse res = new HTTPResponse();
+        copado__Release__c releaseRecord = new copado__Release__c();
+        
+        List<copado__Release__c> lstReleaseToUpdate =  new List<copado__Release__c>();
+        List<Release_Certification_Log__c> lstReleaseLogsToUpdate =  new List<Release_Certification_Log__c>();
+        Map<String,Release_Certification_Log__c> MapAppServiceIdWithReleaseLog = new Map<String,Release_Certification_Log__c>();
+        String body = '';
+        String finalizedGlapiResult = '';
+
+        
+        if(string.isNotEmpty(releaseId) && Schema.sObjectType.copado__Release__c.isQueryable() && Schema.sObjectType.copado__Release__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.isAccessible() && Schema.sObjectType.Release_Certification_Log__c.fields.Status__c.isAccessible() && Schema.sObjectType.copado__Release__c.fields.Id.isAccessible()){
+            releaseRecord = [SELECT id,(SELECT id,SNOW_APPSVCID__c,Azure_Work_Items__c,Execution_Log_Id__c,Change_Request_Number__c,Change_Order_State__c FROM Release_Certification_Logs__r where Status__c=:'Active') FROM copado__Release__c WHERE Id=:releaseId WITH SECURITY_ENFORCED];
+        }
+        for(Release_Certification_Log__c rch : releaseRecord.Release_Certification_Logs__r){
+            MapAppServiceIdWithReleaseLog.put(rch.SNOW_APPSVCID__c,rch);
+        }
+        try{
+            for(String str : MapAppServiceIdWithReleaseLog.keySet()){
+                String endPointUrl ='ChangeOrder/';//5120/APPSVC064748/CHG0072064/-5';
+                endPointUrl = endPointUrl+MapAppServiceIdWithReleaseLog.get(str).Execution_Log_Id__c+'/'+str+'/'+MapAppServiceIdWithReleaseLog.get(str).Change_Request_Number__c+'/'+MapAppServiceIdWithReleaseLog.get(str).Change_Order_State__c;
+                system.debug('endPointUrl val in finalize'+endPointUrl);
+                if(String.isNotBlank(str)){
+                    res = getGlapiCalloutResponse('PUT',null,endPointUrl); 
+                    system.debug('res status code :'+res.getStatusCode());
+                    system.debug('res value :'+res.getBody());
+                    if((res.getStatusCode() == 200 || res.getStatusCode() == 204) && !MapAppServiceIdWithReleaseLog.IsEmpty()){
+                        finalResults ='Pass';
+                        lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,Finalized_Turn_Approval_Status__c='Passed',Callout_Status__c='FInalize Turn Approval Passed'));
+                    }
+                    else{
+                        finalizedglapiResult = 'Error occured during Finalized Glapi Callout. Response Status Code : ' +res.getStatusCode()+ ', Response Status : ' + res.getStatus()+', Response Message : ' + res.getBody();
+                        isFinalizedFailed = True;
+                        finalResults ='Fail';
+                        lstReleaseLogsToUpdate.add(new Release_Certification_Log__c(Id=MapAppServiceIdWithReleaseLog.get(str).Id,Finalized_Turn_Approval_Status__c='Failed',Callout_Status__c='FInalize Turn Approval Failed',Finalized_Turn_Approval_Error_Message__c=finalizedglapiResult));
+                    }
+                    
+                }
+            }
+            if(!isFinalizedFailed){
+                lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Finalized Turn Approval Completed', Quality_Checks_Status__c='Completed'));
+                
+            }
+            else{
+                lstReleaseToUpdate.add(new copado__Release__c(Id= ReleaseId, Current_Glapi_Status__c = 'Finalized Turn Approval Failed', Quality_Checks_Status__c='Failed'));
+                
+            }
+            
+            if(!lstReleaseLogsToUpdate.isEmpty() && Schema.sObjectType.Release_Certification_Log__c.isUpdateable()){
+                update lstReleaseLogsToUpdate;
+            }
+            if(!lstReleaseToUpdate.isEmpty() && Schema.sObjectType.copado__Release__c.isUpdateable()){
+                Update lstReleaseToUpdate;
+            }
+        }catch(Exception e){
+            system.debug('exception '+e +e.getCause()+e.getLineNumber()+e.getMessage());
+        }
+        return finalResults;
+    }
+    
+    @AuraEnabled
+    public static List<String> getChangeOrderDetails(String releaseId) {
+        List<String> changeOrderList = new List<String>();
+        List<Release_Certification_Log__c> rclList = new List<Release_Certification_Log__c>();
+        if(String.isNotBlank(releaseId) && Schema.sObjectType.Release_Certification_Log__c.isAccessible()){
+            rclList = [Select id,Change_Request_Number__c,Change_Order_Status__c from Release_Certification_Log__c where Release__c =:releaseId and Status__c='Active'];
+            for(Release_Certification_Log__c rcl :rclList){
+                if(String.isNotBlank(rcl.Change_Request_Number__c) && String.isNotBlank(rcl.Change_Order_Status__c)){
+                    String ChangeOrder = rcl.Change_Request_Number__c + ' (' + rcl.Change_Order_Status__c + ')';
+                    changeOrderList.add(ChangeOrder);
+                }
+            }
+        }
+        else{
+            throw new AuraHandledException('Users do not have appropriate access');
+        }
+        return changeOrderList;
+    } 
+    
+}
